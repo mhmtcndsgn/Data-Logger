@@ -1,13 +1,20 @@
-name: Build Veri Kaydedici
+name: Build Data Logger
 
-# main'e her push'ta: testler + Windows/macOS derlemesi (Actions > Artifacts)
-# "v2.0.1" gibi bir etiket (tag) push'layınca: ayrıca GitHub Release oluşturulur
+# - main'e her push: testler + Windows/macOS derlemesi (Actions > Artifacts)
+# - Yeni sürüm yayınlamak: Actions > "Build Data Logger" > "Run workflow" >
+#   sürüm kutusuna örn. v2.0.0 yaz > Run. Derleme bitince Releases'a eklenir
+#   ve README'deki indirme butonları otomatik olarak bu sürümü indirir.
 on:
   push:
     branches: [ main ]
     tags: [ "v*" ]
   pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Yayınlanacak sürüm (örn. v2.0.0). Boş bırakırsan sadece derler, yayınlamaz."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -35,11 +42,14 @@ jobs:
           python-version: "3.12"
       - name: Bağımlılıklar
         run: pip install -r requirements.txt pyinstaller
+      - name: Sürüm bilgisi (exe özellikleri)
+        run: python packaging/make_version_info.py packaging/version_info.txt
       - name: Derle (onedir = hızlı açılış)
         run: >
           pyinstaller --noconfirm --clean --windowed --onedir
-          --name "Veri_Kaydedici"
+          --name "Data_Logger"
           --icon assets/icon.ico
+          --version-file packaging/version_info.txt
           --add-data "assets;assets"
           --exclude-module tkinter --exclude-module matplotlib --exclude-module scipy
           --exclude-module PIL --exclude-module PyQt5 --exclude-module PyQt6
@@ -50,16 +60,16 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          $p = Start-Process -FilePath "dist/Veri_Kaydedici/Veri_Kaydedici.exe" -ArgumentList "--selftest","selftest.txt" -Wait -PassThru
+          $p = Start-Process -FilePath "dist/Data_Logger/Data_Logger.exe" -ArgumentList "--selftest","selftest.txt" -Wait -PassThru
           Get-Content selftest.txt
           if ($p.ExitCode -ne 0) { exit 1 }
       - name: Zip
         shell: pwsh
-        run: Compress-Archive -Path dist/Veri_Kaydedici -DestinationPath Veri_Kaydedici_Windows.zip
+        run: Compress-Archive -Path dist/Data_Logger -DestinationPath Data_Logger_Windows.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: Veri_Kaydedici_Windows
-          path: Veri_Kaydedici_Windows.zip
+          name: Data_Logger_Windows
+          path: Data_Logger_Windows.zip
 
   build-macos:
     needs: test
@@ -74,10 +84,10 @@ jobs:
       - name: Derle
         run: >
           pyinstaller --noconfirm --clean --windowed --onedir
-          --name "Veri Kaydedici"
+          --name "Data Logger"
           --icon assets/icon.icns
           --add-data "assets:assets"
-          --osx-bundle-identifier "com.mhmtcndsgn.verikaydedici"
+          --osx-bundle-identifier "com.mhmtcndsgn.datalogger"
           --exclude-module tkinter --exclude-module matplotlib --exclude-module scipy
           --exclude-module PIL --exclude-module PyQt5 --exclude-module PyQt6
           main.py
@@ -86,20 +96,20 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          "dist/Veri Kaydedici.app/Contents/MacOS/Veri Kaydedici" --selftest selftest.txt
+          "dist/Data Logger.app/Contents/MacOS/Data Logger" --selftest selftest.txt
           cat selftest.txt
       - name: DMG
         run: |
-          mkdir -p dmg && cp -R "dist/Veri Kaydedici.app" dmg/
+          mkdir -p dmg && cp -R "dist/Data Logger.app" dmg/
           ln -s /Applications dmg/Applications
-          hdiutil create -volname "Veri Kaydedici" -srcfolder dmg -ov -format UDZO Veri_Kaydedici_macOS.dmg
+          hdiutil create -volname "Data Logger" -srcfolder dmg -ov -format UDZO Data_Logger_macOS.dmg
       - uses: actions/upload-artifact@v4
         with:
-          name: Veri_Kaydedici_macOS
-          path: Veri_Kaydedici_macOS.dmg
+          name: Data_Logger_macOS
+          path: Data_Logger_macOS.dmg
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.version != '')
     needs: [ build-windows, build-macos ]
     runs-on: ubuntu-latest
     steps:
@@ -109,7 +119,19 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          name: "Veri Kaydedici ${{ github.ref_name }}"
+          tag_name: ${{ inputs.version || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: "Data Logger ${{ inputs.version || github.ref_name }}"
+          make_latest: true
+          body: |
+            ## Download / İndir
+
+            | | |
+            |---|---|
+            | 🖥️ **Windows 10/11** | `Data_Logger_Windows.zip` → right-click → **Properties → Unblock** → extract → `Data_Logger.exe` |
+            | 🍎 **macOS** | `Data_Logger_macOS.dmg` → drag to Applications → first launch: right-click → **Open** |
+
+            **TR:** Windows'ta zip'e sağ tıkla → **Özellikler → Engellemeyi kaldır** → Tamam, sonra çıkar. Böylece "açmak istiyor musunuz" uyarısı çıkmaz.
           files: |
-            assets_out/Veri_Kaydedici_Windows.zip
-            assets_out/Veri_Kaydedici_macOS.dmg
+            assets_out/Data_Logger_Windows.zip
+            assets_out/Data_Logger_macOS.dmg
