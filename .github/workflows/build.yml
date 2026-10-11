@@ -1,108 +1,115 @@
-name: Build and Release STM32 Veri Kaydedici
+name: Build STM32 Veri Kaydedici
+
+# main'e her push'ta: testler + Windows/macOS derlemesi (Actions > Artifacts)
+# "v2.0.1" gibi bir etiket (tag) push'layınca: ayrıca GitHub Release oluşturulur
 on:
   push:
     branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - name: Kodu indir
-        uses: actions/checkout@v4
-      - name: Python kur
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Bagimliliklari kur
-        run: pip install pyserial pyinstaller matplotlib
-      - name: .app olustur
-        run: |
-          pyinstaller \
-            --onefile \
-            --windowed \
-            --name "STM32_Veri_Kaydedici" \
-            --collect-all serial \
-            --collect-all matplotlib \
-            --hidden-import serial \
-            --hidden-import serial.tools \
-            --hidden-import serial.tools.list_ports \
-            --hidden-import serial.tools.list_ports_osx \
-            --hidden-import serial.serialutil \
-            --hidden-import matplotlib \
-            --hidden-import matplotlib.backends.backend_tkagg \
-            --osx-bundle-identifier "com.stm32.verikaydedici" \
-            main.py
-      - name: .dmg paket olustur
-        run: |
-          mkdir -p dmg_content
-          cp -r dist/STM32_Veri_Kaydedici.app dmg_content/
-          hdiutil create \
-            -volname "STM32 Veri Kaydedici" \
-            -srcfolder dmg_content \
-            -ov \
-            -format UDZO \
-            STM32_Veri_Kaydedici_macOS.dmg
-      - name: macOS artifact yukle
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-artifact
-          path: STM32_Veri_Kaydedici_macOS.dmg
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - name: Kodu indir
-        uses: actions/checkout@v4
-      - name: Python kur
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Bagimliliklari kur
-        run: pip install pyserial pyinstaller matplotlib
-      - name: .exe olustur
-        run: |
-          pyinstaller `
-            --onefile `
-            --windowed `
-            --name "STM32_Veri_Kaydedici" `
-            --collect-all serial `
-            --collect-all matplotlib `
-            --hidden-import serial `
-            --hidden-import serial.tools `
-            --hidden-import serial.tools.list_ports `
-            --hidden-import serial.tools.list_ports_windows `
-            --hidden-import serial.serialutil `
-            --hidden-import serial.serialwin32 `
-            --hidden-import matplotlib `
-            --hidden-import matplotlib.backends.backend_tkagg `
-            main.py
-      - name: Windows artifact yukle
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-artifact
-          path: dist/STM32_Veri_Kaydedici.exe
-  release:
-    needs: [build-macos, build-windows]
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: macOS dosyasini indir
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          name: macos-artifact
-          path: release_assets/
-      - name: Windows dosyasini indir
-        uses: actions/download-artifact@v4
+          python-version: "3.12"
+      - name: Bağımlılıklar
+        run: pip install pyserial openpyxl numpy pytest
+      - name: Testler
+        run: python -m pytest -q tests
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          name: windows-artifact
-          path: release_assets/
-      - name: Release Olustur
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v1.2.${{ github.run_number }}
-          name: "STM32 Veri Kaydedici (Son Sürüm)"
-          files: |
-            release_assets/STM32_Veri_Kaydedici_macOS.dmg
-            release_assets/STM32_Veri_Kaydedici.exe
+          python-version: "3.12"
+      - name: Bağımlılıklar
+        run: pip install -r requirements.txt pyinstaller
+      - name: Derle (onedir = hızlı açılış)
+        run: >
+          pyinstaller --noconfirm --clean --windowed --onedir
+          --name "STM32_Veri_Kaydedici"
+          --icon assets/icon.ico
+          --add-data "assets;assets"
+          --exclude-module tkinter --exclude-module matplotlib --exclude-module scipy
+          --exclude-module PIL --exclude-module PyQt5 --exclude-module PyQt6
+          main.py
+      - name: Paketi doğrula (DEMO ile uçtan uca test)
+        shell: pwsh
+        timeout-minutes: 3
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process -FilePath "dist/STM32_Veri_Kaydedici/STM32_Veri_Kaydedici.exe" -ArgumentList "--selftest","selftest.txt" -Wait -PassThru
+          Get-Content selftest.txt
+          if ($p.ExitCode -ne 0) { exit 1 }
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/STM32_Veri_Kaydedici -DestinationPath STM32_Veri_Kaydedici_Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: STM32_Veri_Kaydedici_Windows
+          path: STM32_Veri_Kaydedici_Windows.zip
+
+  build-macos:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bağımlılıklar
+        run: pip install -r requirements.txt pyinstaller
+      - name: Derle
+        run: >
+          pyinstaller --noconfirm --clean --windowed --onedir
+          --name "STM32 Veri Kaydedici"
+          --icon assets/icon.icns
+          --add-data "assets:assets"
+          --osx-bundle-identifier "com.mhmtcndsgn.stm32verikaydedici"
+          --exclude-module tkinter --exclude-module matplotlib --exclude-module scipy
+          --exclude-module PIL --exclude-module PyQt5 --exclude-module PyQt6
+          main.py
+      - name: Paketi doğrula (DEMO ile uçtan uca test)
+        timeout-minutes: 3
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          "dist/STM32 Veri Kaydedici.app/Contents/MacOS/STM32 Veri Kaydedici" --selftest selftest.txt
+          cat selftest.txt
+      - name: DMG
+        run: |
+          mkdir -p dmg && cp -R "dist/STM32 Veri Kaydedici.app" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "STM32 Veri Kaydedici" -srcfolder dmg -ov -format UDZO STM32_Veri_Kaydedici_macOS.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: STM32_Veri_Kaydedici_macOS
+          path: STM32_Veri_Kaydedici_macOS.dmg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ build-windows, build-macos ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets_out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: "STM32 Veri Kaydedici ${{ github.ref_name }}"
+          files: |
+            assets_out/STM32_Veri_Kaydedici_Windows.zip
+            assets_out/STM32_Veri_Kaydedici_macOS.dmg
