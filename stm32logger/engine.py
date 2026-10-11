@@ -252,7 +252,7 @@ class Engine:
 
 
 # ======================================================================
-# DEMO: STM32 takılı değilken uygulamayı denemek için sahte seri port
+# DEMO: kart takılı değilken uygulamayı denemek için sahte seri port
 # ======================================================================
 class DemoSerial:
     """pyserial.Serial ile aynı arayüze sahip, veri üreten sahte port.
@@ -368,14 +368,36 @@ def open_port(port: str, baud: int, mode: str):
     return ser
 
 
+# Bilinen kart / USB-seri çip üreticileri (USB VID)
+KNOWN_VIDS = {
+    0x0483: "STM32",          # STMicroelectronics (ST-Link VCP, USB CDC)
+    0x2341: "Arduino",        # Arduino SA
+    0x2A03: "Arduino",        # Arduino.org
+    0x303A: "ESP32",          # Espressif (yerleşik USB)
+    0x1A86: "CH340",          # WCH (Arduino klonları, ESP kartları)
+    0x10C4: "CP210x",         # Silicon Labs (ESP32 DevKit vb.)
+    0x0403: "FTDI",           # FTDI
+    0x2E8A: "Pico",           # Raspberry Pi Pico
+    0x239A: "Adafruit",
+    0x16C0: "Teensy",
+}
+
+
 def list_ports() -> list[tuple[str, str, bool]]:
-    """(port, açıklama, stm32_mi) listesi. STM32 olanlar öne alınır."""
+    """(port, açıklama, bilinen_kart_mı) listesi. Tanınan kartlar öne alınır,
+    Bluetooth sanal portları sona atılır."""
     from serial.tools import list_ports as lp
 
     out = []
     for p in lp.comports():
         desc = p.description or p.device
-        is_stm = (p.vid == 0x0483) or "STM" in desc.upper() or "ST-LINK" in desc.upper()
-        out.append((p.device, desc, is_stm))
-    out.sort(key=lambda x: (not x[2], x[0]))
-    return out
+        board = KNOWN_VIDS.get(p.vid or -1)
+        up = desc.upper()
+        if not board and ("ST-LINK" in up or "STM" in up):
+            board = "STM32"
+        if board and board.upper() not in up:
+            desc = f"{desc} [{board}]"
+        is_bt = "BLUETOOTH" in up
+        out.append((p.device, desc, bool(board), is_bt))
+    out.sort(key=lambda x: (not x[2], x[3], x[0]))
+    return [(d, desc, known) for d, desc, known, _ in out]

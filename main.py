@@ -1,4 +1,4 @@
-"""STM32 Veri Kaydedici — giriş noktası.
+"""Veri Kaydedici — giriş noktası.
 
 Kaynak koddan çalıştırma:
     pip install -r requirements.txt
@@ -15,7 +15,7 @@ def _crash_log_path() -> str:
     base = Path.home() / "Documents"
     if not base.exists():
         base = Path.home()
-    return str(base / "stm32_veri_kaydedici_hata.txt")
+    return str(base / "veri_kaydedici_hata.txt")
 
 
 def _excepthook(exc_type, exc, tb):
@@ -32,7 +32,7 @@ def _excepthook(exc_type, exc, tb):
         if QApplication.instance():
             from stm32logger.i18n import T
 
-            QMessageBox.critical(None, "STM32 Veri Kaydedici", T("tr")("crash", path=path) + "\n\n" + err[-1500:])
+            QMessageBox.critical(None, "Veri Kaydedici", T("tr")("crash", path=path) + "\n\n" + err[-1500:])
     except Exception:
         pass
     sys.__excepthook__(exc_type, exc, tb)
@@ -45,7 +45,7 @@ def main() -> int:
         try:
             import ctypes
 
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("mhmtcndsgn.stm32verikaydedici")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("mhmtcndsgn.verikaydedici")
         except Exception:
             pass
 
@@ -53,7 +53,7 @@ def main() -> int:
     from PySide6.QtWidgets import QApplication
 
     app = QApplication(sys.argv)
-    app.setApplicationName("STM32 Veri Kaydedici")
+    app.setApplicationName("Veri Kaydedici")
     app.setOrganizationName("mhmtcndsgn")
     app.setStyle("Fusion")
 
@@ -80,7 +80,7 @@ def main() -> int:
 def _selftest(app, win) -> None:
     """Paketlenmiş uygulamanın uçtan uca çalıştığını doğrular (CI'da kullanılır).
 
-    STM32_Veri_Kaydedici --selftest sonuc.txt
+    Veri_Kaydedici --selftest sonuc.txt
     DEMO portuna bağlanır, bir deney aktarımı alır, Excel + PNG kaydeder, çıkar.
     """
     import tempfile
@@ -92,7 +92,7 @@ def _selftest(app, win) -> None:
 
     i = sys.argv.index("--selftest")
     out = sys.argv[i + 1] if len(sys.argv) > i + 1 else "selftest.txt"
-    d = tempfile.mkdtemp(prefix="stm32vk_")
+    d = tempfile.mkdtemp(prefix="verikaydedici_")
     win.folder_edit.setText(d)
     win.seg_mode.set_value("dma")
     win._on_mode_changed("dma")

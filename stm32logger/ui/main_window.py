@@ -47,7 +47,7 @@ def _fmt_int(n: int) -> str:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.settings = QSettings(ORG_NAME, "STM32VeriKaydedici")
+        self.settings = QSettings(ORG_NAME, "VeriKaydedici")
         self.lang = str(self.settings.value("lang", "tr"))
         self.t = T(self.lang)
 
@@ -122,11 +122,11 @@ class MainWindow(QMainWindow):
             logo.setPixmap(pm.scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         logo.setStyleSheet("background: transparent;")
         lay.addWidget(logo)
-        a = QLabel("STM32")
-        a.setObjectName("TitleBlue")
+        self.lbl_title_a = QLabel()
+        self.lbl_title_a.setObjectName("TitleBlue")
         self.lbl_title = QLabel()
         self.lbl_title.setObjectName("TitleMain")
-        lay.addWidget(a)
+        lay.addWidget(self.lbl_title_a)
         lay.addWidget(self.lbl_title)
         lay.addStretch(1)
         self.lbl_lang = QLabel()
@@ -397,7 +397,9 @@ class MainWindow(QMainWindow):
     # ================================================================ METİNLER
     def retranslate(self) -> None:
         t = self.t
-        self.lbl_title.setText(t("app_title"))
+        self.lbl_title_a.setText(t("title_a"))
+        self.lbl_title.setText(t("title_b"))
+        self.setWindowTitle(t("app_name"))
         self.lbl_lang.setText(t("language"))
         self.card_conn.title.setText(t("card_conn"))
         self.lbl_port.setText(t("port"))
@@ -477,7 +479,7 @@ class MainWindow(QMainWindow):
     # ================================================================ AYARLAR
     def _default_folder(self) -> str:
         docs = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or str(Path.home())
-        return os.path.join(docs, "STM32 Kayitlari")
+        return os.path.join(docs, "Veri Kaydedici")
 
     def _load_settings(self) -> None:
         s = self.settings

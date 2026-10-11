@@ -1,5 +1,5 @@
 @echo off
-REM STM32 Veri Kaydedici - kaynak koddan calistirma (Windows)
+REM Veri Kaydedici - kaynak koddan calistirma (Windows)
 REM Ilk calistirmada sanal ortam kurar ve kutuphaneleri indirir (1-2 dk).
 cd /d "%~dp0"
 
