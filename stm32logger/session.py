@@ -1,0 +1,339 @@
+"""Bir kayıt oturumunun (bir deney / bir aktarım) verilerini tutar.
+
+Veriler kanal başına `array('d')` dizilerinde tutulur; bu hem bellekte
+kompakt hem de grafiğe hızlı aktarılır. Ekleme işlemcisi (processor) ayrı
+bir thread'de çalışır; arayüz kilit altında kopya alır.
+
+Sıra numarası (ilk sütun 0,1,2,...) varsa her satır kontrol edilir:
+  * ileri atlama  -> kayıp (Gap)
+  * tek bir bozuk sayı (ör. "1234" yerine "34") -> kayıp sayılmaz, düzeltilir
+  * 16 bit sayaç taşması (65535 -> 0) -> devam sayılır
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import math
+import threading
+from array import array
+from bisect import bisect_left
+from dataclasses import dataclass
+
+from .parser import ParsedLine
+
+NAN = float("nan")
+FAST_SEQ_ROWS = 3      # ilk 3 satır ardışıksa hemen karar ver
+SLOW_SEQ_ROWS = 5      # değilse 5 satıra bak (bağlanınca yarım gelen ilk satır vb.)
+LOCK_COLS_AFTER = 10   # bu kadar düzgün satırdan sonra sütun sayısı sabitlenir
+_INT_LIMIT = 9.0e18
+
+
+@dataclass
+class Gap:
+    after_seq: int
+    next_seq: int
+
+    @property
+    def missing(self) -> int:
+        return self.next_seq - self.after_seq - 1
+
+
+def _as_int(v: float) -> int | None:
+    if v != v or not math.isfinite(v) or abs(v) > _INT_LIMIT or not float(v).is_integer():
+        return None
+    return int(v)
+
+
+def _dedupe(names: list[str]) -> list[str]:
+    out, seen = [], {}
+    for n in names:
+        n = n or "?"
+        if n in seen:
+            seen[n] += 1
+            n = f"{n}_{seen[n]}"
+        else:
+            seen[n] = 1
+        out.append(n)
+    return out
+
+
+class Session:
+    def __init__(self, *, mode: str = "live", seq_mode: str = "auto",
+                 channel_prefix: str = "Kanal", port: str = "", baud: int = 0,
+                 sample_rate: float = 0.0):
+        self.mode = mode                  # "live" | "dma" | "file"
+        self.seq_mode = seq_mode          # "auto" | "on" | "off"
+        self.channel_prefix = channel_prefix
+        self.port = port
+        self.baud = baud
+        self.sample_rate = sample_rate
+        self.started_at = _dt.datetime.now()   # ilk satır gelince güncellenir
+        self.ended_at: _dt.datetime | None = None
+        self.lock = threading.Lock()
+        self._touched = False
+
+        self.channels: list[str] = []
+        self.cols: list[array] = []
+        self.t_host = array("d")          # PC'ye ulaşma anı (sn)
+        self.seq = array("q")             # sıra numarası (varsa)
+        self.n = 0
+
+        self.header: list[str] | None = None
+        self.has_seq: bool | None = {"on": True, "off": False}.get(seq_mode)
+        self._pending: list[tuple[float, ParsedLine]] = []
+        self._ncols: int | None = None    # sabitlenmiş alan sayısı
+        self._ncols_seen = 0
+        self._last_seq: int | None = None
+        self._seq_off = 0                 # 16 bit taşma düzeltmesi
+        self._tent: tuple[int, int, int] | None = None   # (son_iyi, şüpheli, seq indeksi)
+
+        self.gaps: list[Gap] = []
+        self.out_of_order = 0             # geri giden sıra numarası
+        self.fixed_seq = 0                # bozuk gelip düzeltilen sıra numarası
+        self.bad_lines = 0                # bozuk satır (yanlış sütun sayısı vb.)
+        self.expected: int | None = None  # START,N
+        self.end_count: int | None = None  # END,N
+        self.saw_start = False
+        self.saw_end = False
+        self.text_lines = 0               # sayısal olmayan satırlar
+        self.bytes = 0
+        self.lines = 0
+        self.finish_reason = ""
+
+    # ------------------------------------------------------------------ ekleme
+    def add(self, t: float, p: ParsedLine) -> None:
+        """İşlemci thread'i çağırır (kilit dışarıda alınır)."""
+        k = p.kind
+        if k == "empty":
+            return
+        if not self._touched:
+            self._touched = True
+            self.started_at = _dt.datetime.now()
+        if k == "data":
+            if self.has_seq is None:
+                self._pending.append((t, p))
+                self._decide_seq()
+                return
+            self._add_data(t, p)
+        elif k == "header":
+            if self.n == 0 and not self._pending:
+                self.header = _dedupe(p.names)
+            else:
+                self.text_lines += 1
+        elif k == "start":
+            self.saw_start = True
+            self.expected = p.count
+            self._resolve_tentative()
+            self._last_seq = None
+            self._seq_off = 0
+        elif k == "end":
+            self.saw_end = True
+            self.end_count = p.count
+            if self.expected is None and p.count is not None:
+                self.expected = p.count
+        elif k == "text":
+            self.text_lines += 1
+
+    def flush_pending(self) -> None:
+        if self._pending:
+            if self.has_seq is None:
+                self.has_seq = False
+            pend, self._pending = self._pending, []
+            for t, p in pend:
+                self._add_data(t, p)
+
+    def _decide_seq(self) -> None:
+        pend = self._pending
+        first = pend[0][1]
+        if first.named is not None or len(first.values) < 2:
+            self.has_seq = False
+            self.flush_pending()
+            return
+        heads = [(_as_int(p.values[0]) if p.values else None) for _, p in pend]
+
+        def consecutive(hs):
+            return all(h is not None for h in hs) and all(hs[i + 1] - hs[i] == 1 for i in range(len(hs) - 1))
+
+        if len(pend) >= FAST_SEQ_ROWS and consecutive(heads):
+            self.has_seq = True
+        elif len(pend) >= SLOW_SEQ_ROWS:
+            rest = heads[1:]
+            ok_steps = sum(1 for i in range(len(rest) - 1)
+                           if rest[i] is not None and rest[i + 1] is not None and rest[i + 1] - rest[i] == 1)
+            self.has_seq = all(h is not None for h in rest) and ok_steps >= len(rest) - 2
+            # Bağlantı yayının ortasında açıldıysa ilk satır yarım gelmiş olabilir
+            if not self.saw_start:
+                v0, v1 = pend[0][1].values, pend[1][1].values
+                bad0 = len(v0) < len(v1) or (self.has_seq and (heads[0] is None or heads[0] != heads[1] - 1))
+                if bad0:
+                    self.bad_lines += 1
+                    pend.pop(0)
+        else:
+            return
+        self.flush_pending()
+
+    def _ensure(self, name: str) -> int:
+        try:
+            return self.channels.index(name)
+        except ValueError:
+            self.channels.append(name)
+            col = array("d", [NAN]) * self.n if self.n else array("d")
+            self.cols.append(col)
+            return len(self.channels) - 1
+
+    def _default_name(self, i: int) -> str:
+        return f"{self.channel_prefix} {i + 1}"
+
+    def _add_data(self, t: float, p: ParsedLine) -> None:
+        row: dict[int, float] = {}
+        seq_val = None
+        if p.named is not None:
+            for name, v in p.named.items():
+                row[self._ensure(name)] = v
+        else:
+            vals = p.values
+            # Sütun sayısı sabitlendikten sonra farklı uzunluktaki satır = bozuk (birleşmiş/yarım satır)
+            if self._ncols is not None and len(vals) != self._ncols:
+                self.bad_lines += 1
+                return
+            hdr = self.header
+            if self.has_seq and vals:
+                raw = _as_int(vals[0])
+                if raw is None:
+                    self.bad_lines += 1
+                    return
+                seq_val = self._check_seq(raw)
+                if len(vals) > 1:
+                    vals = vals[1:]
+                    if hdr and len(hdr) == len(vals) + 1:
+                        hdr = hdr[1:]
+            if hdr and len(hdr) != len(vals):
+                hdr = None
+                if self.n == 0:
+                    self.header = None
+            for i, v in enumerate(vals):
+                if i < len(self.channels):
+                    idx = i
+                else:
+                    idx = self._ensure(hdr[i] if hdr else self._default_name(i))
+                row[idx] = v
+            if self._ncols is None:
+                n_fields = len(p.values)
+                if self._ncols_seen and n_fields == self._ncols_last:
+                    self._ncols_seen += 1
+                else:
+                    self._ncols_seen, self._ncols_last = 1, n_fields
+                if self._ncols_seen >= LOCK_COLS_AFTER:
+                    self._ncols = n_fields
+        if not row:
+            return
+        for i, col in enumerate(self.cols):
+            col.append(row.get(i, NAN))
+        if self.has_seq:
+            self.seq.append(seq_val if seq_val is not None else self.n)
+        self.t_host.append(t)
+        self.n += 1
+
+    _ncols_last = 0
+
+    def _check_seq(self, raw: int) -> int:
+        """Sıra numarasını kontrol eder; saklanacak (taşma düzeltilmiş) değeri döndürür."""
+        s = raw + self._seq_off
+        last = self._last_seq
+        if last is not None and s < last and last - s > 32768 and last - self._seq_off <= 65535 and raw < 32768:
+            self._seq_off += 65536            # 16 bit sayaç 65535 -> 0
+            s = raw + self._seq_off
+
+        if self._tent is not None:
+            good, sus, idx = self._tent
+            self._tent = None
+            if s == good + 2 and sus != good + 1:
+                # şüpheli değer aslında good+1'di, sadece bozuk geldi -> düzelt
+                self.seq[idx] = good + 1
+                self.fixed_seq += 1
+                self._last_seq = s
+                return s
+            self._commit(good, sus)
+            last = self._last_seq = sus
+
+        if last is None or s == last + 1:
+            self._last_seq = s
+        else:
+            # beklenmeyen değer: bir sonraki satıra bakıp karar vereceğiz
+            self._tent = (last, s, len(self.seq))
+            self._last_seq = s
+        return s
+
+    def _commit(self, good: int, val: int) -> None:
+        if val > good + 1:
+            self.gaps.append(Gap(good, val))
+        elif val <= good:
+            self.out_of_order += 1
+
+    def _resolve_tentative(self) -> None:
+        if self._tent is not None:
+            good, sus, _ = self._tent
+            self._tent = None
+            self._commit(good, sus)
+
+    # ------------------------------------------------------------- sorgular
+    @property
+    def missing(self) -> int:
+        gap_missing = sum(g.missing for g in self.gaps)
+        exp_missing = 0
+        if self.expected is not None and self.ended_at is not None:
+            exp_missing = max(0, self.expected - self.n)
+        return max(gap_missing, exp_missing)
+
+    @property
+    def integrity_known(self) -> bool:
+        return bool(self.has_seq) or self.expected is not None
+
+    @property
+    def integrity_ok(self) -> bool:
+        return self.missing == 0 and self.out_of_order == 0 and self.bad_lines == 0
+
+    def finish(self, reason: str) -> None:
+        self.flush_pending()
+        self._resolve_tentative()
+        self.ended_at = _dt.datetime.now()
+        self.finish_reason = reason
+
+    def x_values(self, start: int = 0, end: int | None = None, prefer: str = "auto") -> tuple[list, str]:
+        """Dışa aktarım için x ekseni: ("time"|"sample"|"host")."""
+        end = self.n if end is None else end
+        kind = prefer
+        if kind == "auto":
+            kind = "host" if self.mode == "live" else ("time" if self.sample_rate > 0 else "sample")
+        if kind == "time" and self.sample_rate > 0:
+            fs = self.sample_rate
+            if self.has_seq and len(self.seq) >= end and end > 0:
+                s0 = self.seq[0]
+                return [(s - s0) / fs for s in self.seq[start:end]], "time"
+            return [i / fs for i in range(start, end)], "time"
+        if kind == "host":
+            return list(self.t_host[start:end]), "host"
+        if self.has_seq and len(self.seq) >= end and end > 0:
+            return list(self.seq[start:end]), "sample"
+        return list(range(start, end)), "sample"
+
+    def index_from_host_time(self, t0: float) -> int:
+        return bisect_left(self.t_host, t0)
+
+    def channel_stats(self, n: int | None = None) -> list[dict]:
+        n = self.n if n is None else n
+        out = []
+        for name, col in zip(self.channels, self.cols):
+            vals = [v for v in col[:n] if v == v]
+            if not vals:
+                out.append({"name": name, "count": 0})
+                continue
+            cnt = len(vals)
+            mean = math.fsum(vals) / cnt
+            var = math.fsum((v - mean) ** 2 for v in vals) / cnt if cnt > 1 else 0.0
+            out.append({"name": name, "count": cnt, "min": min(vals), "max": max(vals),
+                        "mean": mean, "std": math.sqrt(var)})
+        return out
+
+    def duration_s(self) -> float:
+        end = self.ended_at or _dt.datetime.now()
+        return (end - self.started_at).total_seconds()

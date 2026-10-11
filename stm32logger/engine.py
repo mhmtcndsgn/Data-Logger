@@ -1,0 +1,381 @@
+"""Kayıpsız seri port okuma motoru.
+
+Eski sürümde veri kaybının sebebi, okuma thread'inin her satırda dosyayı
+açıp kapatması ve arayüzü güncellemesiydi: bu sırada işletim sisteminin
+seri port tamponu dolup taşıyor, aradaki baytlar kayboluyordu.
+
+Yeni mimari üç katmanlı:
+
+    [Okuyucu thread]  sadece ser.read() yapar, baytları kuyruğa atar.
+          │           Başka hiçbir iş yapmadığı için tampon asla taşmaz.
+          ▼
+    [İşlemci thread]  ham yedeği yazar, satırlara böler, çözümler,
+          │           oturuma ekler, aktarım bitişini algılar.
+          ▼
+    [Arayüz]          50 ms'de bir toplu olarak ekrana yansıtır.
+
+Arayüz yavaşlarsa veri bellekte birikir; hiçbir zaman kaybolmaz.
+"""
+from __future__ import annotations
+
+import collections
+import math
+import os
+import queue
+import random
+import threading
+import time
+from typing import Callable
+
+from .parser import parse_line
+from .session import Session
+
+DEMO_PORT = "DEMO"
+
+
+class Engine:
+    def __init__(self, ser, *, mode: str, session_factory: Callable[[], Session],
+                 raw_path: str | None = None, idle_timeout: float = 1.0):
+        self.ser = ser
+        self.mode = mode
+        self.session_factory = session_factory
+        self.idle_timeout = idle_timeout
+        self.raw_path = raw_path
+
+        self.current: Session = session_factory()
+        self.done_q: queue.SimpleQueue[Session] = queue.SimpleQueue()
+        self.events_q: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
+        self.term = collections.deque(maxlen=1500)
+        self.term_dropped = 0
+
+        self.total_bytes = 0
+        self.total_lines = 0
+        self.last_rx = 0.0
+        self.t0 = time.perf_counter()
+
+        self._rx_q: queue.SimpleQueue = queue.SimpleQueue()
+        self._stop = threading.Event()
+        self._reader = threading.Thread(target=self._read_loop, name="serial-reader", daemon=True)
+        self._proc = threading.Thread(target=self._process_loop, name="processor", daemon=True)
+        self._raw = None
+
+    # ----------------------------------------------------------- yaşam döngüsü
+    def start(self) -> None:
+        if self.raw_path:
+            try:
+                os.makedirs(os.path.dirname(self.raw_path) or ".", exist_ok=True)
+                self._raw = open(self.raw_path, "ab", buffering=1024 * 1024)
+            except OSError as e:
+                self.events_q.put(("error", f"raw:{e}"))
+                self._raw = None
+        self._reader.start()
+        self._proc.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._reader.join(timeout=2)
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+        self._proc.join(timeout=30)
+
+    def send(self, data: bytes) -> None:
+        self.ser.write(data)
+
+    @property
+    def running(self) -> bool:
+        return not self._stop.is_set()
+
+    # ----------------------------------------------------------- okuyucu
+    def _read_loop(self) -> None:
+        ser = self.ser
+        put = self._rx_q.put
+        clock = time.perf_counter
+        while not self._stop.is_set():
+            try:
+                n = ser.in_waiting
+                data = ser.read(n if n else 1)
+            except Exception as e:  # USB çıkarıldı vb.
+                if not self._stop.is_set():
+                    self.events_q.put(("disconnected", str(e)))
+                    self._stop.set()
+                break
+            if data:
+                t = clock()
+                self.last_rx = t
+                self.total_bytes += len(data)
+                put((t, data))
+        put(None)  # işlemciye "bitti" sinyali
+
+    # ----------------------------------------------------------- işlemci
+    def _process_loop(self) -> None:
+        try:
+            self._process_loop_inner()
+        except Exception as e:  # noqa: BLE001  — asla sessizce ölme
+            self.events_q.put(("error", f"processor:{e!r}"))
+            self._stop.set()
+            try:
+                with self.current.lock:
+                    has_any = self.current.n
+                if has_any:
+                    self._finish_current("error")
+            except Exception:
+                pass
+            self.events_q.put(("stopped", ""))
+        finally:
+            if self._raw:
+                try:
+                    self._raw.close()
+                except OSError:
+                    pass
+                self._raw = None
+
+    def _process_loop_inner(self) -> None:
+        carry = b""
+        last_flush = time.perf_counter()
+        got_data_since_finish = False
+        while True:
+            items = []
+            try:
+                items.append(self._rx_q.get(timeout=0.05))
+                while True:
+                    items.append(self._rx_q.get_nowait())
+            except queue.Empty:
+                pass
+
+            finished = False
+            for it in items:
+                if it is None:
+                    finished = True
+                    continue
+                t, data = it
+                if self._raw:
+                    try:
+                        self._raw.write(data)
+                    except OSError:
+                        pass
+                got_data_since_finish = True
+                buf = carry + data.replace(b"\r", b"\n")
+                parts = buf.split(b"\n")
+                carry = parts.pop()
+                if len(carry) > 65536:
+                    parts.append(carry)
+                    carry = b""
+                self._handle_lines(t - self.t0, parts, len(data))
+
+            now = time.perf_counter()
+            if self._raw and now - last_flush > 0.5:
+                try:
+                    self._raw.flush()
+                except OSError:
+                    pass
+                last_flush = now
+
+            # Toplu aktarım: belirli süre veri gelmezse aktarım bitti say
+            # (kuyrukta işlenmeyi bekleyen veri varsa asla bitirme: PC yavaş kalmış olabilir)
+            idle_limit = self.idle_timeout
+            cur = self.current
+            if cur.expected is not None and cur.n < cur.expected:
+                idle_limit *= 3   # START,N geldi ama satırlar eksik: biraz daha bekle
+            if (self.mode == "dma" and got_data_since_finish and self.last_rx
+                    and now - self.last_rx > idle_limit and self._rx_q.empty()):
+                if carry:
+                    self._handle_lines(self.last_rx - self.t0, [carry], 0)
+                    carry = b""
+                got_data_since_finish = False
+                with self.current.lock:
+                    has_any = self.current.n or self.current._pending or self.current.saw_start
+                if has_any:
+                    self._finish_current("idle")
+
+            if finished:
+                if carry:
+                    self._handle_lines(time.perf_counter() - self.t0, [carry], 0)
+                with self.current.lock:
+                    has_any = self.current.n or self.current._pending
+                if has_any:
+                    self._finish_current("stop")
+                self.events_q.put(("stopped", ""))
+                return
+
+    def _handle_lines(self, t: float, parts: list[bytes], nbytes: int) -> None:
+        term_append = self.term.append
+        s = self.current
+        s.lock.acquire()
+        try:
+            s.bytes += nbytes
+            for raw in parts:
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                self.total_lines += 1
+                if len(self.term) == self.term.maxlen:
+                    self.term_dropped += 1
+                term_append(line)
+                try:
+                    p = parse_line(line)
+                except Exception:  # noqa: BLE001
+                    s.bad_lines += 1
+                    continue
+                if p.kind == "start" and self.mode == "dma" and (s.n or s._pending):
+                    # Önceki aktarım END göndermeden bitti -> onu kapat, yenisini aç
+                    s.lock.release()
+                    try:
+                        self._finish_current("new-start")
+                    finally:
+                        s = self.current
+                        s.lock.acquire()
+                s.lines += 1
+                try:
+                    s.add(t, p)
+                except Exception:  # noqa: BLE001  bozuk satır motoru durdurmasın
+                    s.bad_lines += 1
+                if p.kind == "end" and self.mode == "dma":
+                    s.lock.release()
+                    try:
+                        self._finish_current("end")
+                    finally:
+                        s = self.current
+                        s.lock.acquire()
+        finally:
+            s.lock.release()
+
+    def _finish_current(self, reason: str) -> None:
+        old = self.current
+        with old.lock:
+            old.finish(reason)
+        self.current = self.session_factory()
+        self.done_q.put(old)
+
+
+# ======================================================================
+# DEMO: STM32 takılı değilken uygulamayı denemek için sahte seri port
+# ======================================================================
+class DemoSerial:
+    """pyserial.Serial ile aynı arayüze sahip, veri üreten sahte port.
+
+    mode="live": 50 Hz'de "sira,adc1,adc2" satırları gönderir.
+    mode="dma" : bağlanınca (ve her "GONDER" komutunda) 4000 örneklik bir
+                 deneyi START/END işaretleriyle, baud hızında topluca yollar.
+    """
+
+    def __init__(self, mode: str = "live", baud: int = 921600, n_samples: int = 4000):
+        self.mode = mode
+        self.baud = max(1200, int(baud))
+        self.n_samples = n_samples
+        self.timeout = 0.05
+        self.is_open = True
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._t_last = time.perf_counter()
+        self._credit = 0.0
+        self._seq = 0
+        self._gen_t = 0.0
+        self._pending_dump = time.perf_counter() + 1.0 if mode == "dma" else None
+        self._run = 0
+
+    # pyserial uyumlu arayüz ------------------------------------------------
+    @property
+    def in_waiting(self) -> int:
+        self._produce()
+        return min(len(self._buf), int(self._credit))
+
+    def read(self, size: int = 1) -> bytes:
+        deadline = time.perf_counter() + self.timeout
+        while True:
+            if not self.is_open:
+                raise OSError("port closed")
+            self._produce()
+            with self._lock:
+                k = min(size, len(self._buf), int(self._credit))
+                if k > 0:
+                    out = bytes(self._buf[:k])
+                    del self._buf[:k]
+                    self._credit -= k
+                    return out
+            if time.perf_counter() >= deadline:
+                return b""
+            time.sleep(0.002)
+
+    def write(self, data: bytes) -> int:
+        cmd = data.decode(errors="ignore").strip().upper()
+        if self.mode == "dma" and cmd in {"GONDER", "GÖNDER", "SEND", "DUMP"}:
+            self._pending_dump = time.perf_counter() + 0.2
+        return len(data)
+
+    def close(self) -> None:
+        self.is_open = False
+
+    def set_buffer_size(self, **_):
+        pass
+
+    # üretici ---------------------------------------------------------------
+    def _produce(self) -> None:
+        now = time.perf_counter()
+        dt = now - self._t_last
+        self._t_last = now
+        bytes_per_s = self.baud / 10.0
+        with self._lock:
+            if self.mode == "live":
+                self._credit = min(self._credit + dt * bytes_per_s, bytes_per_s)
+                self._gen_t += dt
+                while self._gen_t >= 0.02:  # 50 Hz
+                    self._gen_t -= 0.02
+                    t = self._seq * 0.02
+                    a = 2048 + 900 * math.sin(2 * math.pi * 0.5 * t) + random.gauss(0, 25)
+                    b = 1500 + 400 * math.sin(2 * math.pi * 0.13 * t + 1) + random.gauss(0, 15)
+                    self._buf += f"{self._seq},{a:.0f},{b:.0f}\r\n".encode()
+                    self._seq += 1
+            else:
+                self._credit = min(self._credit + dt * bytes_per_s, bytes_per_s)
+                if self._pending_dump and now >= self._pending_dump:
+                    self._pending_dump = None
+                    self._buf += self._make_dump()
+                if not self._buf:
+                    self._credit = 0
+
+    def _make_dump(self) -> bytes:
+        self._run += 1
+        n = self.n_samples
+        fs = 1000.0
+        f = 2.0 + self._run * 0.5
+        lines = [f"START,{n}"]
+        for i in range(n):
+            t = i / fs
+            # sönümlü titreşim + ikinci kanal: ivme benzeri sinyal
+            a = 2048 + 1500 * math.exp(-t * 0.9) * math.sin(2 * math.pi * f * t) + random.gauss(0, 12)
+            b = 2048 + 600 * math.exp(-t * 0.5) * math.cos(2 * math.pi * f * 0.5 * t) + random.gauss(0, 8)
+            lines.append(f"{i},{a:.0f},{b:.0f}")
+        lines.append(f"END,{n}")
+        return ("\r\n".join(lines) + "\r\n").encode()
+
+
+def open_port(port: str, baud: int, mode: str):
+    """Gerçek ya da demo portu açar. Windows'ta sürücü tamponunu büyütür."""
+    if port == DEMO_PORT:
+        return DemoSerial(mode=mode, baud=baud)
+    import serial  # geç yükleme: açılışı hızlandırır
+
+    ser = serial.Serial(port, baud, timeout=0.05, write_timeout=1)
+    try:
+        # Windows varsayılanı ~4 KB; 1 MB'a çıkarıyoruz (taşmaya karşı ek güvence)
+        ser.set_buffer_size(rx_size=1024 * 1024, tx_size=16384)
+    except Exception:
+        pass
+    return ser
+
+
+def list_ports() -> list[tuple[str, str, bool]]:
+    """(port, açıklama, stm32_mi) listesi. STM32 olanlar öne alınır."""
+    from serial.tools import list_ports as lp
+
+    out = []
+    for p in lp.comports():
+        desc = p.description or p.device
+        is_stm = (p.vid == 0x0483) or "STM" in desc.upper() or "ST-LINK" in desc.upper()
+        out.append((p.device, desc, is_stm))
+    out.sort(key=lambda x: (not x[2], x[0]))
+    return out
