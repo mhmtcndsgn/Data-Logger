@@ -1,7 +1,7 @@
 """Küçük, yeniden kullanılabilir arayüz parçaları."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel, QPushButton,
                                QVBoxLayout, QWidget)
 
@@ -135,3 +135,24 @@ def hrow(*widgets, stretch_first=True) -> QHBoxLayout:
     for i, w in enumerate(widgets):
         lay.addWidget(w, 1 if (i == 0 and stretch_first) else 0)
     return lay
+
+
+class WheelGuard(QObject):
+    """Odakta olmayan sayı kutusu / açılır listenin fare tekerleğini yok sayar.
+
+    Böylece yan paneli kaydırırken imleç bir kutunun üstünden geçince değeri
+    (ör. aktarım bitiş süresi) yanlışlıkla değişmez; tekerlek paneli kaydırır.
+    """
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Wheel and not obj.hasFocus():
+            ev.ignore()
+            return True
+        return False
+
+
+def guard_wheel(*widgets) -> None:
+    g = WheelGuard(widgets[0])
+    for w in widgets:
+        w.setFocusPolicy(Qt.StrongFocus)
+        w.installEventFilter(g)

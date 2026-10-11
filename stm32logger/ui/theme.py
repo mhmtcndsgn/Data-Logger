@@ -132,8 +132,13 @@ QMenu::item:selected {{ background: {BLUE}; }}
 
 
 def build_qss(assets_dir) -> str:
-    from pathlib import Path
+    """Stil sayfasını üretir.
 
-    a = Path(assets_dir)
-    return (QSS.replace("__CHECK__", (a / "check.svg").as_posix())
-               .replace("__CHEVRON__", (a / "chevron.svg").as_posix()))
+    SVG'ler dosya yoluyla değil Qt arama yolu ("assets:") ile verilir: uygulama
+    boşluk / Türkçe karakter içeren bir klasörde (ör. "Masaüstü", "... (1)")
+    çalışınca yol stil sayfasını bozup tüm temayı devre dışı bırakıyordu.
+    """
+    from PySide6.QtCore import QDir
+
+    QDir.setSearchPaths("assets", [str(assets_dir)])
+    return QSS.replace("__CHECK__", "assets:check.svg").replace("__CHEVRON__", "assets:chevron.svg")

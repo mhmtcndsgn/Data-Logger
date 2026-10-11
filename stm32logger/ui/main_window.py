@@ -25,7 +25,7 @@ from ..exporter import FORMATS, default_filename, export_session
 from ..i18n import T
 from ..session import Session
 from . import theme as th
-from .widgets import Card, PanelHeader, Segmented, Tile, hint_label, hrow
+from .widgets import Card, PanelHeader, Segmented, Tile, guard_wheel, hint_label, hrow
 
 ASSETS = Path(__file__).resolve().parent.parent.parent / "assets"
 BAUDS = ["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600", "1000000", "2000000"]
@@ -77,6 +77,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1080, 700)
 
         self._build()
+        guard_wheel(self.port_cb, self.baud_cb, self.fs_spin, self.seq_cb, self.idle_spin,
+                    self.x_cb, self.win_cb, self.eol_cb, self.lang_cb)
         self._load_settings()
         self.retranslate()
         self._refresh_ports(initial=True)
