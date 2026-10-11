@@ -1,4 +1,4 @@
-name: Build STM32 Veri Kaydedici
+name: Build Veri Kaydedici
 
 # main'e her push'ta: testler + Windows/macOS derlemesi (Actions > Artifacts)
 # "v2.0.1" gibi bir etiket (tag) push'layınca: ayrıca GitHub Release oluşturulur
@@ -38,7 +38,7 @@ jobs:
       - name: Derle (onedir = hızlı açılış)
         run: >
           pyinstaller --noconfirm --clean --windowed --onedir
-          --name "STM32_Veri_Kaydedici"
+          --name "Veri_Kaydedici"
           --icon assets/icon.ico
           --add-data "assets;assets"
           --exclude-module tkinter --exclude-module matplotlib --exclude-module scipy
@@ -50,16 +50,16 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          $p = Start-Process -FilePath "dist/STM32_Veri_Kaydedici/STM32_Veri_Kaydedici.exe" -ArgumentList "--selftest","selftest.txt" -Wait -PassThru
+          $p = Start-Process -FilePath "dist/Veri_Kaydedici/Veri_Kaydedici.exe" -ArgumentList "--selftest","selftest.txt" -Wait -PassThru
           Get-Content selftest.txt
           if ($p.ExitCode -ne 0) { exit 1 }
       - name: Zip
         shell: pwsh
-        run: Compress-Archive -Path dist/STM32_Veri_Kaydedici -DestinationPath STM32_Veri_Kaydedici_Windows.zip
+        run: Compress-Archive -Path dist/Veri_Kaydedici -DestinationPath Veri_Kaydedici_Windows.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: STM32_Veri_Kaydedici_Windows
-          path: STM32_Veri_Kaydedici_Windows.zip
+          name: Veri_Kaydedici_Windows
+          path: Veri_Kaydedici_Windows.zip
 
   build-macos:
     needs: test
@@ -74,10 +74,10 @@ jobs:
       - name: Derle
         run: >
           pyinstaller --noconfirm --clean --windowed --onedir
-          --name "STM32 Veri Kaydedici"
+          --name "Veri Kaydedici"
           --icon assets/icon.icns
           --add-data "assets:assets"
-          --osx-bundle-identifier "com.mhmtcndsgn.stm32verikaydedici"
+          --osx-bundle-identifier "com.mhmtcndsgn.verikaydedici"
           --exclude-module tkinter --exclude-module matplotlib --exclude-module scipy
           --exclude-module PIL --exclude-module PyQt5 --exclude-module PyQt6
           main.py
@@ -86,17 +86,17 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          "dist/STM32 Veri Kaydedici.app/Contents/MacOS/STM32 Veri Kaydedici" --selftest selftest.txt
+          "dist/Veri Kaydedici.app/Contents/MacOS/Veri Kaydedici" --selftest selftest.txt
           cat selftest.txt
       - name: DMG
         run: |
-          mkdir -p dmg && cp -R "dist/STM32 Veri Kaydedici.app" dmg/
+          mkdir -p dmg && cp -R "dist/Veri Kaydedici.app" dmg/
           ln -s /Applications dmg/Applications
-          hdiutil create -volname "STM32 Veri Kaydedici" -srcfolder dmg -ov -format UDZO STM32_Veri_Kaydedici_macOS.dmg
+          hdiutil create -volname "Veri Kaydedici" -srcfolder dmg -ov -format UDZO Veri_Kaydedici_macOS.dmg
       - uses: actions/upload-artifact@v4
         with:
-          name: STM32_Veri_Kaydedici_macOS
-          path: STM32_Veri_Kaydedici_macOS.dmg
+          name: Veri_Kaydedici_macOS
+          path: Veri_Kaydedici_macOS.dmg
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -109,7 +109,7 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          name: "STM32 Veri Kaydedici ${{ github.ref_name }}"
+          name: "Veri Kaydedici ${{ github.ref_name }}"
           files: |
-            assets_out/STM32_Veri_Kaydedici_Windows.zip
-            assets_out/STM32_Veri_Kaydedici_macOS.dmg
+            assets_out/Veri_Kaydedici_Windows.zip
+            assets_out/Veri_Kaydedici_macOS.dmg
