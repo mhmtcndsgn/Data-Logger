@@ -58,7 +58,7 @@ void loop() {
     String komut = Serial.readStringUntil('\n');
     komut.trim();
     komut.toUpperCase();
-    if (komut == "GONDER") {
+    if (komut == "GONDER" || komut == "SEND") {
       deneyiTopla();
       deneyiGonder();
     }

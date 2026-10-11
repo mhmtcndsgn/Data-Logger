@@ -4,9 +4,9 @@ from __future__ import annotations
 STRINGS: dict[str, dict[str, str]] = {
     "tr": {
         # başlık / genel
-        "title_a": "Veri",
-        "title_b": "Kaydedici",
-        "app_name": "Veri Kaydedici",
+        "title_a": "Data",
+        "title_b": "Logger",
+        "app_name": "Data Logger",
         "language": "Dil",
         # bağlantı kartı
         "card_conn": "Bağlantı",
@@ -122,6 +122,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "col_pc_time": "PC zamanı",
         "col_elapsed": "Geçen süre (s)",
         "channel_prefix": "Kanal",
+        "default_prefix": "deney",
         "sheet_summary": "Özet",
         "sheet_data": "Veriler",
         "sheet_chart": "Grafik",
@@ -263,6 +264,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "col_pc_time": "PC time",
         "col_elapsed": "Elapsed (s)",
         "channel_prefix": "Channel",
+        "default_prefix": "experiment",
         "sheet_summary": "Summary",
         "sheet_data": "Data",
         "sheet_chart": "Chart",

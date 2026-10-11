@@ -1,5 +1,5 @@
 /*
- * STM32 Veri Kaydedici — STM32 tarafı örnek kod (HAL)
+ * Data Logger — STM32 tarafı örnek kod (HAL)
  * ====================================================
  *
  * Akış:

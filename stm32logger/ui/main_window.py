@@ -47,7 +47,7 @@ def _fmt_int(n: int) -> str:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.settings = QSettings(ORG_NAME, "VeriKaydedici")
+        self.settings = QSettings(ORG_NAME, "DataLogger")
         self.lang = str(self.settings.value("lang", "tr"))
         self.t = T(self.lang)
 
@@ -479,7 +479,7 @@ class MainWindow(QMainWindow):
     # ================================================================ AYARLAR
     def _default_folder(self) -> str:
         docs = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or str(Path.home())
-        return os.path.join(docs, "Veri Kaydedici")
+        return os.path.join(docs, "Data Logger")
 
     def _load_settings(self) -> None:
         s = self.settings
@@ -491,7 +491,7 @@ class MainWindow(QMainWindow):
         self.idle_spin.setValue(float(s.value("idle", 1.0) or 1.0))
         self.seg_fmt.set_value(str(s.value("fmt", "xlsx")))
         self.folder_edit.setText(str(s.value("folder", "") or self._default_folder()))
-        self.prefix_edit.setText(str(s.value("prefix", "deney")))
+        self.prefix_edit.setText(str(s.value("prefix", "") or self.t("default_prefix")))
         self.chk_auto.setChecked(str(s.value("autosave", "true")).lower() == "true")
         self.chk_raw.setChecked(str(s.value("raw", "true")).lower() == "true")
         i = self.x_cb.findData(str(s.value("xaxis", "auto")))

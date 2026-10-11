@@ -1,102 +1,83 @@
-# ⚡ Veri Kaydedici v2
+<p align="center">
+  <img src="assets/icon.png" width="96" alt="Data Logger icon">
+</p>
 
-Seri porttan (UART / USB sanal COM) gelen verileri **kayıpsız** toplayan, canlı grafiğini çizen ve **Excel / CSV / TXT** olarak kaydeden masaüstü uygulaması.
+<h1 align="center">Data Logger</h1>
 
-**Çalıştığı kartlar:** STM32 (ST-Link sanal COM ya da USB), Arduino (Uno, Nano, Mega…), ESP32, ESP8266, Raspberry Pi Pico ve CH340 / CP2102 / FTDI USB-seri dönüştürücülü her kart. Kısacası seri porttan satır satır yazı gönderen her cihaz.
+<p align="center">
+  <b>🇬🇧 English</b> · <a href="README.tr.md">🇹🇷 Türkçe</a>
+</p>
 
-> Eski adı: *STM32 Veri Kaydedici*
+<p align="center">
+  Lossless serial data logger for <b>STM32, Arduino, ESP32</b> and any board that prints lines over a serial port.<br>
+  Live chart, gap detection, and one-click export to <b>Excel / CSV / TXT</b>.
+</p>
 
-![Deney aktarımı](docs/ekran_deney.png)
+<p align="center">
+  <a href="https://github.com/mhmtcndsgn/Data-Logger/releases/latest/download/Data_Logger_Windows.zip"><img src="https://img.shields.io/badge/Download-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows"></a>
+  <a href="https://github.com/mhmtcndsgn/Data-Logger/releases/latest/download/Data_Logger_macOS.dmg"><img src="https://img.shields.io/badge/Download-macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS"></a>
+  <br>
+  <a href="https://github.com/mhmtcndsgn/Data-Logger/releases/latest"><img src="https://img.shields.io/github/v/release/mhmtcndsgn/Data-Logger?label=latest&style=flat-square" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT license">
+</p>
 
----
-
-## ✨ v2'de neler değişti?
-
-| | v1.2 | v2.0 |
-|---|---|---|
-| Hızlı veride kayıp (ör. 1450 → 1780 atlaması) | Var | **Yok**: okuma ayrı bir thread'de, veri asla beklemiyor |
-| Kayıp tespiti | Yok | **Sıra no + START/END ile otomatik**, grafikte kırmızı bölge |
-| Çıktı biçimi | Sadece .txt | **Excel (.xlsx)**, CSV, TXT + ham yedek |
-| Grafik | Kayıttan sonra, yavaş | **Canlı**, 1 milyon nokta ~1 sn'de, zoom/pan, PNG |
-| DMA ile toplu gönderim | Desteklenmiyor | **"Deney aktarımı" modu**: bitişi algılar, otomatik kaydeder |
-| Zaman damgası | Saniye | **Milisaniye** + örnekleme frekansından gerçek zaman |
-| Açılış | Yavaş (onefile + matplotlib) | Hızlı (onedir, gereksiz kütüphane yok) |
-| Dil | Türkçe | **Türkçe / English** |
-| Kart olmadan deneme | Yok | **DEMO portu** |
-| Desteklenen kartlar | STM32 | **STM32, Arduino, ESP32/8266, Pico…** (port listesinde ★ ile tanınır) |
-
-### Eski sürümde veri neden kayboluyordu?
-Okuma thread'i her satırda (1) kayıt dosyasını açıp kapatıyor, (2) ekrana yazıyordu. Dosya OneDrive'daki Masaüstü'nde olduğunda, antivirüs ve senkronizasyon yüzünden dosyayı açmak bazen yüzlerce ms sürebiliyor. Bu sırada Windows'un seri port tamponu (varsayılan birkaç KB) dolup taşıyor ve **aradaki satırlar kayboluyordu**. Ekrandaki metin kutusu da hiç temizlenmediği için zamanla yavaşlıyordu; kaymanın "bir süre sonra" başlaması bununla uyumlu. Kart, DMA'daki veriyi deney sonunda tam hızda gönderdiği için sorun en çok o anda görülüyordu.
-
-v2'de veri üç katmandan geçiyor:
-
-```
-[Okuyucu thread]  sadece ser.read() → kuyruk     (tampon asla taşmaz, sürücü tamponu 1 MB)
-[İşlemci thread]  ham yedek + satırlara böl + çözümle + aktarım sonu tespiti
-[Arayüz]          50 ms'de bir toplu güncelleme  (yavaşlarsa veri bellekte bekler, kaybolmaz)
-```
-
-Test: 300.000 satırlık tek parça aktarım ≈ 125.000 satır/sn hızında, sıfır kayıpla işleniyor (921600 baud'un ~20 katı).
-
-![Kayıp tespiti](docs/ekran_kayip.png)
+![Data Logger](docs/screenshot.png)
 
 ---
 
-## ⬇️ İndirme
+## ✨ Features
 
-**Actions** sekmesi → en son başarılı build → **Artifacts**:
+- **Zero data loss.** Reading runs in its own thread and never waits on the disk or the screen, so high-speed bursts (e.g. a DMA buffer dumped at 921600 baud) arrive complete. Tested with a 300,000-line burst at ~125,000 lines/s.
+- **Gap detection.** If the board sends a sequence number and `START,N` / `END,N` markers, every lost line is counted and highlighted in red on the chart.
+- **Two modes**
+  - **Live monitor:** data streams onto the chart as it arrives.
+  - **Experiment dump:** the board records into memory and sends everything at the end; the app detects the end of the transfer, saves it automatically and waits for the next one.
+- **Excel, CSV or TXT.** Excel files include a summary sheet (integrity, min/max/mean), the data and a chart. A raw backup of every received byte is kept as well.
+- **Fast live chart** with zoom/pan and PNG export; 1 million points render in about a second.
+- **Board detection:** STM32 (ST-Link), Arduino, ESP32, CH340, CP2102, FTDI and Raspberry Pi Pico ports are marked with ★.
+- **Send commands** to the board (e.g. `SEND` to request a new dump).
+- **English / Turkish** interface, settings are remembered.
+- **DEMO port** to try everything without a board.
 
-| Platform | Dosya | Çalıştırma |
-|---|---|---|
-| 🖥️ Windows | `Veri_Kaydedici_Windows.zip` | Zip'i bir klasöre çıkar → `Veri_Kaydedici.exe` |
-| 🍎 macOS | `Veri_Kaydedici_macOS.dmg` | Aç → Applications'a sürükle |
-
-> `v2.0.0` gibi bir etiket (tag) push'layınca bu dosyalar **Releases** sayfasına da otomatik eklenir.
->
-> macOS'ta "bilinmeyen geliştirici" uyarısı çıkarsa: **Sistem Ayarları → Gizlilik ve Güvenlik → Yine de Aç**.
-
----
-
-## 🚀 Kullanım
-
-### Deney aktarımı modu (DMA ile toplu gönderim)
-1. Portu seç (tanınan kartlar — STM32, Arduino, ESP32… — ★ ile işaretli ve otomatik seçilir), baud'u kart koduyla aynı yap.
-2. **Deney aktarımı** modunu seç → **Bağlan**.
-3. Kartta deneyi başlat. Deney bitip veri gelince uygulama:
-   - ilerleme çubuğunu gösterir (kart `START,N` gönderiyorsa),
-   - aktarım bitince (`END` gelince ya da 1 sn veri gelmeyince) **otomatik kaydeder**,
-   - eksik veri varsa kırmızı uyarı verir ve grafikte yerini gösterir,
-   - bağlantıyı koparmadan **sonraki deneyi bekler**.
-
-### Canlı izleme modu
-Kart sürekli veri gönderiyorsa: veriler anlık grafikte akar, **Bağlantıyı kes** deyince kaydedilir. Grafikte son 10 sn / 30 sn / 1 dk / 5 dk ya da tümü gösterilebilir.
-
-### Kart olmadan denemek
-Port listesinin en altındaki **DEMO** seçeneğiyle bağlan. Deney aktarımı modunda 4000 örneklik sahte bir deney gönderir. Komut kutusuna `GONDER` yazarsan tekrar gönderir.
-
-### Kaydedilen dosyalar
-Varsayılan klasör: `Belgeler\Veri Kaydedici` (değiştirilebilir).
-
-- `deney_2026-10-11_14-30-05.xlsx`: **Özet** (port, süre, bütünlük, kanal istatistikleri), **Veriler**, **Grafik** sayfaları
-- `ham\ham_....txt`: Karttan gelen her bayt, hiç değiştirilmeden (her ihtimale karşı)
-
-**Kayıtlı dosyayı aç…** ile eski kayıtlar (v1'in `.txt` dosyaları dahil) yeniden grafikte açılabilir.
+![Gap detection](docs/screenshot_gap.png)
 
 ---
 
-## 📡 Kart tarafı: veri biçimi
+## ⬇️ Install
 
-Uygulama şu satırların hepsini anlar:
+### Windows 10 / 11
+1. Download **[Data_Logger_Windows.zip](https://github.com/mhmtcndsgn/Data-Logger/releases/latest/download/Data_Logger_Windows.zip)**.
+2. **Before extracting:** right-click the zip → **Properties** → tick **Unblock** at the bottom → **OK**.
+   *This prevents the "Do you want to run this file?" / SmartScreen warning. The app is not code-signed yet (see [Code signing](#-code-signing-policy)).*
+3. Extract and run **`Data_Logger.exe`**. Keep it next to its `_internal` folder.
+
+### macOS
+1. Download **[Data_Logger_macOS.dmg](https://github.com/mhmtcndsgn/Data-Logger/releases/latest/download/Data_Logger_macOS.dmg)** and drag the app to **Applications**.
+2. First launch: right-click the app → **Open** (or **System Settings → Privacy & Security → Open Anyway**).
+
+---
+
+## 🚀 Usage
+
+1. Select the port (known boards are marked ★) and the same baud rate as your firmware.
+2. Choose **Live monitor** or **Experiment dump** and click **Connect**.
+3. Files are saved to `Documents\Data Logger` by default. **Open saved file…** reopens any earlier recording, including files from v1.
+
+---
+
+## 📡 Data format (board side)
+
+The app understands all of these, one per line:
 
 ```
-1450                      tek kanal
-12,345,678                çok kanal (virgül, noktalı virgül, boşluk ya da tab)
-Sicaklik:25.3 Nem:60      isimli kanallar
-zaman,ivme,sicaklik       başlık satırı (veriden önce gelirse kanal adı olur)
-START,4000 / END,4000     aktarımın başı / sonu (BASLA / BITTI da olur)
+1450                      single value
+12,345,678                multiple channels (comma, semicolon, space or tab)
+Temp:25.3 Hum:60          named channels
+time,adc1,adc2            header line (before data) → channel names
+START,4000 / END,4000     start / end of a dump
 ```
 
-**Kayıpları yakalamak için önerilen biçim**: ilk sütunda 0'dan artan sıra numarası, başta `START,N`, sonda `END,N`:
+**Recommended for loss detection:** a sequence number in the first column, plus `START,N` and `END,N`:
 
 ```
 START,4000
@@ -107,41 +88,54 @@ START,4000
 END,4000
 ```
 
-Hazır örnekler:
-- **STM32 (HAL):** [`firmware_ornek/veri_gonder.c`](firmware_ornek/veri_gonder.c) (Timer tetiklemeli ADC + DMA + UART gönderimi)
-- **Arduino / ESP32 / ESP8266:** [`firmware_ornek/arduino_ornek/arduino_ornek.ino`](firmware_ornek/arduino_ornek/arduino_ornek.ino) (canlı mod ya da `GONDER` komutuyla deney aktarımı)
+Ready-made examples:
+- **STM32 (HAL):** [`firmware_ornek/veri_gonder.c`](firmware_ornek/veri_gonder.c): timer-triggered ADC + DMA + UART dump
+- **Arduino / ESP32 / ESP8266:** [`firmware_ornek/arduino_ornek/arduino_ornek.ino`](firmware_ornek/arduino_ornek/arduino_ornek.ino): live mode, or a dump on the `GONDER` command
 
-> ⚠️ DMA'yı **Circular** modda kullanıp gönderim sırasında örneklemeye devam ederseniz tampon başa dönüp eski verinin üstüne yazar. Bu durumda da veriler "kayar". Deney kaydı için DMA **Normal** modda olmalı ve gönderimden önce `HAL_ADC_Stop_DMA` çağrılmalı.
+> ⚠️ **STM32 users:** if the ADC DMA runs in **Circular** mode while you transmit, the buffer wraps and overwrites old samples, which looks like "jumping" data. Use **Normal** mode and call `HAL_ADC_Stop_DMA` before sending.
 
 ---
 
-## 🛠️ Geliştirici: kaynak koddan çalıştırma
+## 🛠️ Run from source
 
-Windows'ta en kolayı: **`baslat.bat`** dosyasına çift tıkla. İlk seferde gerekenleri kurar.
-
-Elle:
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
+On Windows you can also double-click **`baslat.bat`**: it sets everything up on first run.
 
-Testler:
-```bash
-pip install pytest
-python -m pytest tests
+Tests: `pip install pytest && python -m pytest tests`
+
+### Releasing a new version
+**Actions → Build Data Logger → Run workflow**, type a version such as `v2.0.1`, then click **Run**. Windows and macOS builds are tested automatically, published under **Releases**, and the download buttons above always point to the latest one.
+
+### Project layout
+```
+main.py                     entry point
+stm32logger/                application package
+  engine.py                 lossless serial reader + DEMO port
+  parser.py / session.py    line parsing, sequence / gap detection
+  exporter.py / importer.py Excel / CSV / TXT
+  ui/                       PySide6 + pyqtgraph interface
+firmware_ornek/             STM32 and Arduino/ESP32 examples
+packaging/                  Windows version info for the .exe
+tests/                      tests (incl. a 300k-line stress test)
 ```
 
-### Proje yapısı
-```
-main.py                     giriş noktası
-stm32logger/
-  engine.py                 kayıpsız okuma motoru + DEMO port
-  parser.py                 satır çözümleyici
-  session.py                oturum verisi, sıra no / kayıp tespiti
-  exporter.py               Excel / CSV / TXT çıktısı
-  importer.py               kayıtlı dosyaları açma
-  i18n.py                   Türkçe / English metinler
-  ui/                       PySide6 arayüzü (pyqtgraph grafik)
-firmware_ornek/             STM32 (HAL) ve Arduino/ESP32 örnek kodları
-tests/                      testler (300 bin satırlık yük testi dahil)
-```
+---
+
+## 🔏 Code signing policy
+
+Windows builds are produced only by the public GitHub Actions workflow in this repository, from the source code in this repository. Free code signing through [SignPath Foundation](https://signpath.org) has been applied for. Until it is approved, releases are unsigned.
+
+- **Committers and reviewers:** [mhmtcndsgn](https://github.com/mhmtcndsgn)
+- **Approvers:** [mhmtcndsgn](https://github.com/mhmtcndsgn)
+
+### Privacy policy
+This program does not transfer any information to other networked systems. It only communicates with the serial device you select and writes files to the folder you choose.
+
+---
+
+## 📄 License
+
+[MIT](LICENSE) © 2026 Mehmet Can
