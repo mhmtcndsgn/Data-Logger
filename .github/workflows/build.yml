@@ -2,8 +2,16 @@ name: Build Data Logger
 
 # - main'e her push: testler + Windows/macOS derlemesi (Actions > Artifacts)
 # - Yeni sürüm yayınlamak: Actions > "Build Data Logger" > "Run workflow" >
-#   sürüm kutusuna örn. v2.0.0 yaz > Run. Derleme bitince Releases'a eklenir
-#   ve README'deki indirme butonları otomatik olarak bu sürümü indirir.
+#   sürüm kutusuna örn. v2.1.0 yaz > Run. Sürüm, stm32logger/__init__.py içindeki
+#   __version__ ile aynı olmalı. Derleme bitince Releases'a eklenir; README'deki
+#   indirme butonları otomatik olarak bu sürümü indirir.
+#
+# Güvenlik:
+# - Varsayılan yetki sadece "okuma". Yazma yetkisi yalnızca yayın (release) adımında.
+# - Tüm dış GitHub Action'lar değişmez commit SHA'sıyla sabitlendi.
+# - Python paketleri requirements-lock.txt'deki SHA-256 parmak izleriyle kurulur.
+# - Her dosyanın parmak izi exe'nin yanına (manifest) ve sürüme (SHA256SUMS.txt) eklenir,
+#   ayrıca GitHub "derleme kanıtı" (artifact attestation) üretilir.
 on:
   push:
     branches: [ main ]
@@ -12,23 +20,43 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Yayınlanacak sürüm (örn. v2.0.0). Boş bırakırsan sadece derler, yayınlamaz."
+        description: "Yayınlanacak sürüm (örn. v2.1.0). Boş bırakırsan sadece derler, yayınlamaz."
         required: false
         default: ""
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Bağımlılıklar
-        run: pip install pyserial openpyxl numpy pytest
+      - name: Sürüm etiketi kontrolü
+        if: inputs.version != '' || startsWith(github.ref, 'refs/tags/v')
+        env:
+          VER: ${{ inputs.version || github.ref_name }}
+        run: |
+          python - <<'EOF'
+          import os, re, sys
+          from stm32logger import __version__
+          tag = os.environ["VER"]
+          if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+              sys.exit(f"Sürüm biçimi vX.Y.Z olmalı (örn. v2.1.0), yazılan: {tag!r}")
+          if tag[1:] != __version__:
+              sys.exit(f"Sürüm uyuşmuyor: {tag} yazıldı ama stm32logger/__init__.py içinde {__version__} var")
+          print("OK", tag)
+          EOF
+      - name: Bağımlılıklar (parmak izi kontrollü)
+        run: pip install --require-hashes -r requirements-lock.txt
       - name: Testler
         run: python -m pytest -q tests
 
@@ -36,17 +64,19 @@ jobs:
     needs: test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Bağımlılıklar
-        run: pip install -r requirements.txt pyinstaller
+      - name: Bağımlılıklar (parmak izi kontrollü)
+        run: pip install --require-hashes -r requirements-lock.txt
       - name: Sürüm bilgisi (exe özellikleri)
         run: python packaging/make_version_info.py packaging/version_info.txt
       - name: Derle (onedir = hızlı açılış)
         run: >
-          pyinstaller --noconfirm --clean --windowed --onedir
+          pyinstaller --noconfirm --clean --windowed --onedir --noupx
           --name "Data_Logger"
           --icon assets/icon.ico
           --version-file packaging/version_info.txt
@@ -54,7 +84,9 @@ jobs:
           --exclude-module tkinter --exclude-module matplotlib --exclude-module scipy
           --exclude-module PIL --exclude-module PyQt5 --exclude-module PyQt6
           main.py
-      - name: Paketi doğrula (DEMO ile uçtan uca test)
+      - name: Dosya parmak izleri (manifest)
+        run: python packaging/make_manifest.py dist/Data_Logger
+      - name: Paketi doğrula (DEMO ile uçtan uca test + bütünlük)
         shell: pwsh
         timeout-minutes: 3
         env:
@@ -63,10 +95,11 @@ jobs:
           $p = Start-Process -FilePath "dist/Data_Logger/Data_Logger.exe" -ArgumentList "--selftest","selftest.txt" -Wait -PassThru
           Get-Content selftest.txt
           if ($p.ExitCode -ne 0) { exit 1 }
+          if (-not (Select-String -Path selftest.txt -Pattern "integrity=ok" -Quiet)) { exit 1 }
       - name: Zip
         shell: pwsh
         run: Compress-Archive -Path dist/Data_Logger -DestinationPath Data_Logger_Windows.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Data_Logger_Windows
           path: Data_Logger_Windows.zip
@@ -75,15 +108,17 @@ jobs:
     needs: test
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Bağımlılıklar
-        run: pip install -r requirements.txt pyinstaller
+      - name: Bağımlılıklar (parmak izi kontrollü)
+        run: pip install --require-hashes -r requirements-lock.txt
       - name: Derle
         run: >
-          pyinstaller --noconfirm --clean --windowed --onedir
+          pyinstaller --noconfirm --clean --windowed --onedir --noupx
           --name "Data Logger"
           --icon assets/icon.icns
           --add-data "assets:assets"
@@ -103,7 +138,7 @@ jobs:
           mkdir -p dmg && cp -R "dist/Data Logger.app" dmg/
           ln -s /Applications dmg/Applications
           hdiutil create -volname "Data Logger" -srcfolder dmg -ov -format UDZO Data_Logger_macOS.dmg
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Data_Logger_macOS
           path: Data_Logger_macOS.dmg
@@ -112,12 +147,27 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.version != '')
     needs: [ build-windows, build-macos ]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write       # sürümü oluşturmak için
+      id-token: write       # derleme kanıtı (attestation) imzası için
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: assets_out
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - name: SHA256SUMS
+        working-directory: assets_out
+        run: |
+          sha256sum Data_Logger_Windows.zip Data_Logger_macOS.dmg > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Derleme kanıtı (artifact attestation)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            assets_out/Data_Logger_Windows.zip
+            assets_out/Data_Logger_macOS.dmg
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ inputs.version || github.ref_name }}
           target_commitish: ${{ github.sha }}
@@ -129,9 +179,16 @@ jobs:
             | | |
             |---|---|
             | 🖥️ **Windows 10/11** | `Data_Logger_Windows.zip` → right-click → **Properties → Unblock** → extract → `Data_Logger.exe` |
-            | 🍎 **macOS** | `Data_Logger_macOS.dmg` → drag to Applications → first launch: right-click → **Open** |
+            | 🍎 **macOS (Apple Silicon)** | `Data_Logger_macOS.dmg` → drag to Applications → first launch: **System Settings → Privacy & Security → Open Anyway** |
 
-            **TR:** Windows'ta zip'e sağ tıkla → **Özellikler → Engellemeyi kaldır** → Tamam, sonra çıkar. Böylece "açmak istiyor musunuz" uyarısı çıkmaz.
+            **TR:** Windows'ta zip'e sağ tıkla → **Özellikler → Engellemeyi kaldır** → Tamam, sonra çıkar. Böylece "açmak istiyor musunuz" uyarısı çıkmaz. macOS'ta ilk açılışta **Sistem Ayarları → Gizlilik ve Güvenlik → Yine de Aç**.
+
+            ### Verify the download / İndirmeyi doğrula
+            - `SHA256SUMS.txt` lists the SHA-256 fingerprint of each file. / Her dosyanın parmak izi `SHA256SUMS.txt` içinde.
+              Windows: `Get-FileHash Data_Logger_Windows.zip` · macOS: `shasum -a 256 Data_Logger_macOS.dmg`
+            - Built by GitHub Actions from this repository (build provenance): `gh attestation verify Data_Logger_Windows.zip -R mhmtcndsgn/Data-Logger`
+            - In the app / Uygulamada: **? → About / Hakkında → Verify files / Dosyaları doğrula**
           files: |
             assets_out/Data_Logger_Windows.zip
             assets_out/Data_Logger_macOS.dmg
+            assets_out/SHA256SUMS.txt
