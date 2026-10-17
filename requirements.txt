@@ -3,3 +3,4 @@ pyqtgraph>=0.13.3
 pyserial>=3.5
 openpyxl>=3.1
 numpy>=1.24
+defusedxml>=0.7.1

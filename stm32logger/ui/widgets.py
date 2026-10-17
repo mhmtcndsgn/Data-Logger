@@ -89,9 +89,9 @@ class Tile(QFrame):
         self.value.setObjectName("TileValue")
         self.sub = QLabel(" ")
         self.sub.setObjectName("TileSub")
-        lay.addWidget(self.label)
-        lay.addWidget(self.value)
-        lay.addWidget(self.sub)
+        for w in (self.label, self.value, self.sub):
+            w.setTextFormat(Qt.PlainText)   # dosya/port adı HTML olarak yorumlanmasın
+            lay.addWidget(w)
         self._last = None
 
     def set(self, value: str, sub: str = " ", color: str | None = None) -> None:

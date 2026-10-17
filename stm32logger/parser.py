@@ -11,18 +11,23 @@ Desteklenen satır biçimleri:
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 
 _NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 NUM_RE = re.compile(rf"^{_NUM}$")
-KV_RE = re.compile(rf"([A-Za-zÇĞİÖŞÜçğıöşü_][\wÇĞİÖŞÜçğıöşü.]*)\s*[:=]\s*({_NUM})")
+# (?<![\w.]) : isim sadece kelime başında başlayabilir. Bu olmadan uzun bir satırda
+# her harf için yeniden deneme yapılır ve süre karesel artar (kötü niyetli/bozuk veriyle donma).
+KV_RE = re.compile(rf"(?<![\w.])([A-Za-zÇĞİÖŞÜçğıöşü_][\wÇĞİÖŞÜçğıöşü.]*)\s*[:=]\s*({_NUM})")
 MARKER_RE = re.compile(
     r"^\s*(START|BEGIN|BASLA|BAŞLA|END|STOP|BITTI|BİTTİ|BITIS|BİTİŞ)\b[\s,:;=]*(\d+)?",
     re.IGNORECASE,
 )
 HEADER_TOK_RE = re.compile(r"^[\wÇĞİÖŞÜçğıöşü().%/\-\[\] ]+$")
 NAN = float("nan")
+MAX_LINE = 4096        # bundan uzun satır veri sayılmaz (bozuk/birleşmiş satır, bellek ve CPU koruması)
+MAX_FIELDS = 64        # bir satırdan en fazla bu kadar kanal okunur
 # Eski sürümün kayıt biçimi: "[2025-06-25 16:35:00] Sicaklik:25.3"
 OLD_TS_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?\]\s*")
 
@@ -43,12 +48,18 @@ def _is_num(tok: str) -> bool:
     return bool(NUM_RE.match(tok))
 
 
+def _f(tok: str) -> float:
+    """Sayıya çevirir; taşan değerler (1e999 -> inf) NaN olur, dosyaya 'inf' yazılmaz."""
+    v = float(tok)
+    return v if math.isfinite(v) else NAN
+
+
 def parse_line(line: str) -> ParsedLine:
     s = line.strip()
     if not s:
         return ParsedLine("empty")
-    if s[0] == "#":
-        return ParsedLine("text", text=s)
+    if s[0] == "#" or len(s) > MAX_LINE:
+        return ParsedLine("text", text=s[:200])
 
     # İşaret satırları: hızlı ön kontrol (rakamla başlayan satırlar işaret olamaz)
     if s[0].isalpha():
@@ -61,17 +72,23 @@ def parse_line(line: str) -> ParsedLine:
 
         kv = KV_RE.findall(s)
         if kv:
-            return ParsedLine("data", named={k: float(v) for k, v in kv}, text=s)
+            named: dict[str, float] = {}
+            for k, v in kv:
+                if k in named or len(named) < MAX_FIELDS:
+                    named[k] = _f(v)
+            return ParsedLine("data", named=named, text=s)
 
     # Ayraç: virgül / noktalı virgül / tab varsa tek ayraçla böl (boş alan = NaN, kanal kaymaz)
     delim = "," if "," in s else (";" if ";" in s else ("\t" if "\t" in s else None))
     if delim:
         toks = [t.strip() for t in s.rstrip(delim + " ").split(delim)]   # "1,2,3," sondaki ayraç yok sayılır
+        if len(toks) > MAX_FIELDS + 1:      # +1: sıra numarası sütunu
+            return ParsedLine("text", text=s[:200])
         vals = []
         n_num = 0
         for t in toks:
             if _is_num(t):
-                vals.append(float(t))
+                vals.append(_f(t))
                 n_num += 1
             else:
                 vals.append(NAN)
@@ -83,8 +100,8 @@ def parse_line(line: str) -> ParsedLine:
 
     # Boşlukla ayrılmış: hepsi sayıysa veri, değilse metin ("Boot 3", "System ready" gibi)
     toks = s.split()
-    if all(_is_num(t) for t in toks):
-        return ParsedLine("data", values=[float(t) for t in toks], text=s)
+    if len(toks) <= MAX_FIELDS + 1 and all(_is_num(t) for t in toks):
+        return ParsedLine("data", values=[_f(t) for t in toks], text=s)
     return ParsedLine("text", text=s)
 
 

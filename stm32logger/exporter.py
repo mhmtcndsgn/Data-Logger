@@ -4,6 +4,9 @@ from __future__ import annotations
 import csv
 import datetime as _dt
 import os
+import re
+import tempfile
+import time
 
 from . import __version__, APP_NAME
 from .i18n import T
@@ -13,6 +16,26 @@ from .session import Session
 FORMATS = {"txt": ".txt", "csv": ".csv", "xlsx": ".xlsx"}
 XLSX_MAX_ROWS = 1_000_000          # Excel sınırı 1.048.576; güvenli pay
 XLSX_CHART_MAX_ROWS = 20_000
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+_BAD_NAME_CH = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def safe_text(v: str) -> str:
+    """Excel/LibreOffice'in metni formül sanmasını engeller (CSV formül enjeksiyonu).
+
+    Kanal adları karttan gelir; "=HYPERLINK(...)" gibi bir ad dosyayı açanı riske atmasın.
+    """
+    return "'" + v if v.startswith(_FORMULA_START) else v
+
+
+def safe_prefix(prefix: str, fallback: str = "deney") -> str:
+    """Dosya adı önekini Windows/macOS'ta geçerli ve güvenli hale getirir."""
+    p = _BAD_NAME_CH.sub("_", (prefix or "").strip()).replace(" ", "_")
+    p = p.strip(". ")[:60]
+    if not p or p.upper() in _RESERVED or p in ("..", "."):
+        p = fallback
+    return p
 
 
 def _columns(s: Session, lang: str, n: int):
@@ -46,6 +69,8 @@ def _fmt_cell(v) -> str:
         return fmt_num(v)
     if isinstance(v, _dt.datetime):
         return v.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    if isinstance(v, str):
+        return safe_text(v)
     return str(v)
 
 
@@ -89,22 +114,52 @@ def summary_rows(s: Session, lang: str, n: int | None = None) -> list[tuple[str,
 
 def default_filename(s: Session, prefix: str, fmt: str) -> str:
     stamp = s.started_at.strftime("%Y-%m-%d_%H-%M-%S")
-    prefix = (prefix or "deney").strip().replace(" ", "_")
-    return f"{prefix}_{stamp}{FORMATS[fmt]}"
+    return f"{safe_prefix(prefix)}_{stamp}{FORMATS[fmt]}"
 
 
-def export_session(s: Session, path: str, fmt: str, lang: str = "tr") -> str:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+def _replace(tmp: str, path: str) -> None:
+    """os.replace; Windows'ta dosya kısa süre kilitliyse (antivirüs, OneDrive) birkaç kez dener."""
+    for i in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as e:
+            if i == 9:   # hedef dosya büyük ihtimalle Excel'de açık
+                raise PermissionError(e.errno, e.strerror, path) from None
+            time.sleep(0.15)
+
+
+def export_session(s: Session, path: str, fmt: str, lang: str = "tr", info: dict | None = None) -> str:
+    """Dosyayı önce geçici adla yazar, bitince asıl ada taşır.
+
+    Böylece yazma yarıda kalırsa (disk doldu, program kapandı) yarım/bozuk bir
+    dosya asıl adla ortada kalmaz; varsa eski dosya da bozulmaz.
+    """
+    path = os.path.abspath(path)
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
     with s.lock:
         if s.ended_at is not None:
             s.flush_pending()
         n = s.n          # kayıt sürerken dışa aktarılırsa: o anki satırlar
-    if fmt == "xlsx":
-        _export_xlsx(s, path, lang, n)
-    elif fmt == "csv":
-        _export_delim(s, path, lang, ",", False, n)
-    else:
-        _export_delim(s, path, lang, "\t", True, n)
+    if info is not None:
+        info["rows"] = n
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=f".{os.path.basename(path)}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        if fmt == "xlsx":
+            _export_xlsx(s, tmp, lang, n)
+        elif fmt == "csv":
+            _export_delim(s, tmp, lang, ",", False, n)
+        else:
+            _export_delim(s, tmp, lang, "\t", True, n)
+        _replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -113,9 +168,9 @@ def _export_delim(s: Session, path: str, lang: str, delim: str, comments: bool, 
     with open(path, "w", encoding="utf-8-sig" if not comments else "utf-8", newline="") as f:
         if comments:
             for k, v in summary_rows(s, lang, n):
-                f.write(f"# {k}: {v}\n")
+                f.write(f"# {k}: {v}\n".replace("\r", " "))
         w = csv.writer(f, delimiter=delim, lineterminator="\n")
-        w.writerow(heads)
+        w.writerow([safe_text(str(h)) for h in heads])
         for i in range(n):
             w.writerow([_fmt_cell(g(i)) for g in getters])
 
@@ -151,8 +206,15 @@ def _export_xlsx(s: Session, path: str, lang: str, n: int) -> None:
     for col in "CDEFG":
         ws_sum.column_dimensions[col].width = 14
 
-    def hcell(ws, v):
+    def tcell(ws, v):
+        """Metin hücresi: '=' ile başlasa bile formül olarak yazılmaz."""
         c = WriteOnlyCell(ws, value=v)
+        if isinstance(v, str) and v.startswith("="):
+            c.data_type = "s"
+        return c
+
+    def hcell(ws, v):
+        c = tcell(ws, v)
         c.font = hdr_font
         c.fill = hdr_fill
         c.alignment = center
@@ -163,9 +225,9 @@ def _export_xlsx(s: Session, path: str, lang: str, n: int) -> None:
     ws_sum.append([title])
     ws_sum.append([])
     for k, v in summary_rows(s, lang, n):
-        kc = WriteOnlyCell(ws_sum, value=k)
+        kc = tcell(ws_sum, k)
         kc.font = Font(bold=True)
-        vc = WriteOnlyCell(ws_sum, value=int(v) if v.isdigit() else v)
+        vc = tcell(ws_sum, int(v) if v.isdigit() else v)
         if k == t("sum_integrity"):
             ok = v == t("ok")
             vc.font = Font(bold=True, color="1A7F37" if ok else ("CF222E" if v == t("not_ok") else "9A6700"))
@@ -175,10 +237,10 @@ def _export_xlsx(s: Session, path: str, lang: str, n: int) -> None:
                                               t("stat_mean"), t("stat_std"))])
     for st in s.channel_stats(n):
         if st["count"]:
-            ws_sum.append([st["name"], st["count"], _num(st["min"]), _num(st["max"]),
+            ws_sum.append([tcell(ws_sum, st["name"]), st["count"], _num(st["min"]), _num(st["max"]),
                            round(st["mean"], 6), round(st["std"], 6)])
         else:
-            ws_sum.append([st["name"], 0])
+            ws_sum.append([tcell(ws_sum, st["name"]), 0])
 
     # --- Veri sayfaları ----------------------------------------------------
     data_sheets = []

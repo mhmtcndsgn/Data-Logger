@@ -3,7 +3,24 @@ REM Data Logger - kaynak koddan calistirma (Windows)
 REM Ilk calistirmada sanal ortam kurar ve kutuphaneleri indirir (1-2 dk).
 cd /d "%~dp0"
 
-if exist ".venv\Scripts\pythonw.exe" goto calistir
+if not exist ".venv\Scripts\pythonw.exe" goto kurulum
+REM Yeni surumde kutuphane listesi degistiyse sadece eksikleri kur
+fc /b requirements.txt ".venv\req.txt" >nul 2>nul
+if errorlevel 1 goto guncelle
+goto calistir
+
+:guncelle
+echo Kutuphaneler guncelleniyor...
+".venv\Scripts\python.exe" -m pip install -r requirements.txt
+if errorlevel 1 (
+    echo Kutuphaneler guncellenemedi; eski haliyle aciliyor.
+    pause
+    goto calistir
+)
+copy /y requirements.txt ".venv\req.txt" >nul
+goto calistir
+
+:kurulum
 
 REM --- Gercek bir Python var mi? (Microsoft Store kisayolu sayilmaz) ---
 set "PY="
@@ -41,6 +58,7 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+copy /y requirements.txt ".venv\req.txt" >nul
 
 :calistir
 start "" ".venv\Scripts\pythonw.exe" main.py

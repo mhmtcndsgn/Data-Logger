@@ -35,11 +35,19 @@
 - **Excel, CSV or TXT.** Excel files include a summary sheet (integrity, min/max/mean), the data and a chart. A raw backup of every received byte is kept as well.
 - **Fast live chart** with zoom/pan and PNG export; 1 million points render in about a second.
 - **Board detection:** STM32 (ST-Link), Arduino, ESP32, CH340, CP2102, FTDI and Raspberry Pi Pico ports are marked with ★.
-- **Send commands** to the board (e.g. `SEND` to request a new dump).
-- **English / Turkish** interface, settings are remembered.
+- **Send commands** to the board (e.g. `SEND` to request a new dump), as text or **HEX bytes**; **↑ / ↓** recalls previous commands. A **HEX view** shows the raw bytes.
+- **Auto-reconnect:** if the USB cable drops or the board restarts, the data received so far is saved and the app reconnects when the port is back.
+- **Never loses a recording by accident:** asks before closing / reconnecting / opening a file when data is unsaved, writes files atomically (no half-written files), and splits very long live recordings every 1 million rows so memory never fills up.
+- **Keyboard shortcuts:** F5 connect/disconnect · Ctrl+S save as · Ctrl+O open · Ctrl+L clear terminal · F1 guide.
+- **English / Turkish** interface, settings are remembered (*? → Reset settings* if anything goes wrong).
 - **DEMO port** to try everything without a board.
+- **Built-in illustrated guide** (English / Turkish): click **?** or press **F1**. The same menu has *Check for updates*, *Report a problem / suggestion* and *About*.
+- **No more Windows warning after the first launch:** the app offers once to remove Windows' "downloaded from the internet" mark (same as *Properties → Unblock*), but only from its own files whose fingerprint matches the build.
+- **Verify files:** *? → About → Verify files* checks the SHA-256 fingerprint of every file in the app folder and reports modified, missing or unknown (added) files. See [Security](#-security).
 
 ![Gap detection](docs/screenshot_gap.png)
+
+![Built-in guide](docs/guide_en.png)
 
 ---
 
@@ -48,12 +56,16 @@
 ### Windows 10 / 11
 1. Download **[Data_Logger_Windows.zip](https://github.com/mhmtcndsgn/Data-Logger/releases/latest/download/Data_Logger_Windows.zip)**.
 2. **Before extracting:** right-click the zip → **Properties** → tick **Unblock** at the bottom → **OK**.
-   *This prevents the "Do you want to run this file?" / SmartScreen warning. The app is not code-signed yet (see [Code signing](#-code-signing-policy)).*
+   *This prevents the "Do you want to run this file?" / SmartScreen warning. The app is not code-signed yet (see [Code signing](#-code-signing-policy)). If you skip this, the app offers to remove the mark itself on first launch, so the warning appears only once.*
 3. Extract and run **`Data_Logger.exe`**. Keep it next to its `_internal` folder.
 
-### macOS
+### macOS (Apple Silicon, M1 and later)
 1. Download **[Data_Logger_macOS.dmg](https://github.com/mhmtcndsgn/Data-Logger/releases/latest/download/Data_Logger_macOS.dmg)** and drag the app to **Applications**.
-2. First launch: right-click the app → **Open** (or **System Settings → Privacy & Security → Open Anyway**).
+2. First launch: open the app once, then go to **System Settings → Privacy & Security** and click **Open Anyway** (on older macOS: right-click the app → **Open**).
+
+### Verify your download (optional)
+- Compare the file's SHA-256 with `SHA256SUMS.txt` on the release page: `Get-FileHash Data_Logger_Windows.zip` (PowerShell) or `shasum -a 256 Data_Logger_macOS.dmg`.
+- Check that it was built by this repository's GitHub Actions: `gh attestation verify Data_Logger_Windows.zip -R mhmtcndsgn/Data-Logger`
 
 ---
 
@@ -107,7 +119,10 @@ On Windows you can also double-click **`baslat.bat`**: it sets everything up on 
 Tests: `pip install pytest && python -m pytest tests`
 
 ### Releasing a new version
-**Actions → Build Data Logger → Run workflow**, type a version such as `v2.0.1`, then click **Run**. Windows and macOS builds are tested automatically, published under **Releases**, and the download buttons above always point to the latest one.
+1. Set `__version__` in `stm32logger/__init__.py` (e.g. `2.1.0`).
+2. **Actions → Build Data Logger → Run workflow**, type the same version with a `v` (e.g. `v2.1.0`), then click **Run**.
+
+Windows and macOS builds are tested automatically, published under **Releases** together with `SHA256SUMS.txt` and build provenance, and the download buttons above always point to the latest one. The workflow refuses to publish if the two versions differ.
 
 ### Project layout
 ```
@@ -116,11 +131,25 @@ stm32logger/                application package
   engine.py                 lossless serial reader + DEMO port
   parser.py / session.py    line parsing, sequence / gap detection
   exporter.py / importer.py Excel / CSV / TXT
+  help.py                   in-app guide texts (TR / EN)
+  system.py                 file integrity, Windows unblock, update check, issue link
   ui/                       PySide6 + pyqtgraph interface
+assets/help/                guide images (regenerate: python packaging/make_help_images.py)
 firmware_ornek/             STM32 and Arduino/ESP32 examples
-packaging/                  Windows version info for the .exe
+packaging/                  exe version info, file fingerprints (manifest), guide images
 tests/                      tests (incl. a 300k-line stress test)
+requirements-lock.txt       pinned, hash-checked dependencies for the build
+SECURITY.md                 security policy and how releases are protected
 ```
+
+---
+
+## 🔒 Security
+
+- Releases are built only by GitHub Actions from this repository, with pinned actions, hash-checked dependencies, a read-only token, SHA-256 checksums and signed build provenance.
+- The app needs no administrator rights and never downloads or runs anything by itself.
+- Data from the board is treated as untrusted (length / channel limits, formula-safe CSV/Excel export).
+- Found a vulnerability? Please report it privately, see **[SECURITY.md](SECURITY.md)**.
 
 ---
 
@@ -132,7 +161,7 @@ Windows builds are produced only by the public GitHub Actions workflow in this r
 - **Approvers:** [mhmtcndsgn](https://github.com/mhmtcndsgn)
 
 ### Privacy policy
-This program does not transfer any information to other networked systems. It only communicates with the serial device you select and writes files to the folder you choose.
+This program does not transfer any information to other networked systems unless specifically requested by the user. It only communicates with the serial device you select and writes files to the folder you choose. The only network request is made when you click **Check for updates**: it reads the latest version number from the GitHub API. **Report a problem** only opens a GitHub page in your browser; nothing is sent until you submit it yourself.
 
 ---
 

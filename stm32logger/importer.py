@@ -1,11 +1,15 @@
 """Daha önce kaydedilmiş dosyaları (yeni TXT/CSV/XLSX ya da eski sürüm .txt) açar."""
 from __future__ import annotations
 
+import itertools
+import math
 import os
 
 from .i18n import STRINGS
 from .parser import parse_line, strip_old_timestamp, NUM_RE
-from .session import Session, _dedupe
+from .session import MAX_CHANNELS, Session, _dedupe
+
+MAX_FILE_BYTES = 4 * 1024 ** 3     # 4 GB üstü dosya açılmaz (bellek koruması)
 
 _META_KEYS = ("col_index", "col_seq", "col_time_s", "col_pc_time", "col_elapsed")
 
@@ -22,9 +26,11 @@ def _to_float(v):
     if v is None or v == "":
         return float("nan")
     if isinstance(v, (int, float)):
-        return float(v)
-    v = str(v).strip()
-    return float(v) if NUM_RE.match(v) else float("nan")
+        f = float(v)
+    else:
+        v = str(v).strip()
+        f = float(v) if NUM_RE.match(v) else float("nan")
+    return f if math.isfinite(f) else float("nan")
 
 
 def _session_from_table(heads: list[str], rows, channel_prefix: str) -> Session | None:
@@ -33,8 +39,11 @@ def _session_from_table(heads: list[str], rows, channel_prefix: str) -> Session 
     if not any(roles):
         return None
     s = Session(mode="file", seq_mode="off", channel_prefix=channel_prefix)
-    ch_idx = [i for i, r in enumerate(roles) if r is None]
-    names = _dedupe([str(heads[i]).strip() or f"{channel_prefix} {j + 1}" for j, i in enumerate(ch_idx)])
+    ch_idx = [i for i, r in enumerate(roles) if r is None][:MAX_CHANNELS]
+    def unguard(h: str) -> str:   # dışa aktarımdaki formül korumasını ('=x) geri al
+        return h[1:] if h[:1] == "'" and h[1:2] in ("=", "+", "-", "@") else h
+
+    names = _dedupe([unguard(str(heads[i]).strip()) or f"{channel_prefix} {j + 1}" for j, i in enumerate(ch_idx)])
     seq_i = roles.index("col_seq") if "col_seq" in roles else None
     time_i = roles.index("col_time_s") if "col_time_s" in roles else None
     el_i = roles.index("col_elapsed") if "col_elapsed" in roles else None
@@ -65,6 +74,8 @@ def _session_from_table(heads: list[str], rows, channel_prefix: str) -> Session 
 
 
 def load_file(path: str, channel_prefix: str = "Kanal") -> Session:
+    if os.path.getsize(path) > MAX_FILE_BYTES:
+        raise ValueError("too-big")
     ext = os.path.splitext(path)[1].lower()
     if ext == ".xlsx":
         s = _load_xlsx(path, channel_prefix)
@@ -77,8 +88,6 @@ def load_file(path: str, channel_prefix: str = "Kanal") -> Session:
 
 def _load_xlsx(path: str, channel_prefix: str) -> Session:
     from openpyxl import load_workbook
-
-    import itertools
 
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
@@ -101,22 +110,27 @@ def _load_xlsx(path: str, channel_prefix: str) -> Session:
     raise ValueError("no-data")
 
 
-def _load_text(path: str, channel_prefix: str) -> Session:
+def _lines(path: str):
+    """Dosyayı satır satır okur (tamamını belleğe almaz)."""
     with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
-        lines = [ln.rstrip("\r\n") for ln in f]
-    body = [ln for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
-    if body:
-        first = body[0]
+        for ln in f:
+            yield ln.rstrip("\r\n")
+
+
+def _load_text(path: str, channel_prefix: str) -> Session:
+    body = (ln for ln in _lines(path) if ln.strip() and not ln.lstrip().startswith("#"))
+    first = next(body, None)
+    if first is not None:
         delim = "\t" if "\t" in first else ("," if "," in first else None)
         if delim:
             heads = [h.strip() for h in first.split(delim)]
-            rows = ([c.strip() for c in ln.split(delim)] for ln in body[1:])
+            rows = ([c.strip() for c in ln.split(delim)] for ln in body)
             s = _session_from_table(heads, rows, channel_prefix)
             if s is not None:
                 return s
     # Genel çözümleyici (eski sürüm kayıtları, ham yedekler, düz loglar)
     s = Session(mode="file", seq_mode="auto", channel_prefix=channel_prefix)
-    for i, ln in enumerate(lines):
+    for i, ln in enumerate(_lines(path)):
         p = parse_line(strip_old_timestamp(ln))
         if p.kind in ("empty",):
             continue

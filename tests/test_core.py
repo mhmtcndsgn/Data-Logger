@@ -196,3 +196,281 @@ if __name__ == "__main__":
             t = time.perf_counter()
             fn()
             print(f"OK  {name}  ({time.perf_counter()-t:.2f}s)")
+
+
+def test_unblock_only_known_files_and_verify():
+    from stm32logger import system
+
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "_internal"))
+        exe = os.path.join(d, "Data_Logger.exe")
+        dll = os.path.join(d, "_internal", "Qt6Core.dll")
+        for p in (exe, dll):
+            open(p, "w").write("orijinal " + p)
+        man = system.manifest_path(d)
+        assert system.write_manifest(d, man) == 2
+        v = system.verify_install(d, man)
+        assert v["ok"] and v["checked"] == 2 and not v["extra"]
+
+        evil = os.path.join(d, "_internal", "evil.dll")       # sonradan klasöre eklenen dosya
+        open(evil, "w").write("x")
+        open(dll, "a").write("değişti")                       # değiştirilmiş dosya
+        for p in (exe, dll, evil, man):
+            # Linux'ta ":" dosya adında geçerli; Windows'taki alternatif akışı taklit eder
+            open(p + system.ZONE, "w").write("[ZoneTransfer]\nZoneId=3\n")
+        assert system.is_blocked(exe)
+        v = system.verify_install(d, man)
+        assert not v["ok"] and v["changed"] == ["_internal/Qt6Core.dll"] and v["extra"] == ["_internal/evil.dll"]
+
+        ok, fail, skipped = system.unblock(d, man)
+        assert (ok, fail, skipped) == (2, 0, 2)                # değişmemiş exe + listenin kendisi
+        assert not system.is_blocked(exe)
+        assert system.is_blocked(dll) and system.is_blocked(evil)
+        assert os.path.exists(exe) and os.path.exists(dll)     # asıl dosyalar duruyor
+        os.remove(evil)
+        os.remove(evil + system.ZONE)
+        os.remove(os.path.join(d, "_internal", "Qt6Core.dll"))
+        v = system.verify_install(d, man)
+        assert v["missing"] == ["_internal/Qt6Core.dll"]
+
+
+def test_manifest_rejects_path_tricks():
+    from stm32logger import system
+
+    with tempfile.TemporaryDirectory() as d:
+        m = os.path.join(d, "m.txt")
+        open(m, "w").write("a" * 64 + "  ../../etc/passwd\n" + "b" * 64 + "  ok.dll\n" + "c" * 64 + "  /abs\n")
+        assert list(system.read_manifest(m)) == ["ok.dll"]
+
+
+def test_safe_names_and_formula_injection():
+    from stm32logger.exporter import default_filename, safe_prefix
+
+    bad = safe_prefix('..\\..\\x/y:z*?"<>|\x01')
+    assert not any(c in bad for c in '\\/:*?"<>|\x01') and bad.endswith("x_y_z_______")
+    assert safe_prefix("CON") == "deney" and safe_prefix("  ") == "deney" and safe_prefix("...") == "deney"
+    assert len(safe_prefix("a" * 500)) == 60
+    s = Session(mode="dma")
+    _feed(s, ["=cmd,+x,-y", "1,2,3", "4,5,6", "7,8,9", "10,11,12"])
+    assert "/" not in default_filename(s, "a/b", "csv")
+    d = tempfile.mkdtemp()
+    s.channels[0] = "=HYPERLINK(\"http://x\")"
+    p = export_session(s, os.path.join(d, "a.csv"), "csv")
+    txt = open(p, encoding="utf-8-sig").read()
+    assert "'=HYPERLINK" in txt and ",=" not in txt
+    assert not [f for f in os.listdir(d) if f.endswith(".tmp")]    # geçici dosya kalmadı
+    p = export_session(s, os.path.join(d, "a.xlsx"), "xlsx")
+    from openpyxl import load_workbook
+
+    wb = load_workbook(p)
+    ws = wb.worksheets[1]
+    heads = [c.value for c in ws[1]]
+    i = heads.index("=HYPERLINK(\"http://x\")")
+    assert ws.cell(1, i + 1).data_type == "s"                      # formül değil, düz metin
+
+
+def test_atomic_export_keeps_old_file_on_error():
+    import pytest
+
+    from stm32logger import exporter
+
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "x.txt")
+    open(p, "w").write("eski")
+    s = Session()
+    _feed(s, ["1", "2", "3"])
+    orig = exporter._export_delim
+
+    def boom(*a, **k):
+        open(a[1], "w").write("yarım")
+        raise OSError("disk full")
+
+    exporter._export_delim = boom
+    try:
+        with pytest.raises(OSError):
+            exporter.export_session(s, p, "txt")
+    finally:
+        exporter._export_delim = orig
+    assert open(p).read() == "eski" and os.listdir(d) == ["x.txt"]
+
+
+def test_help_guide_complete():
+    from stm32logger import help as guide
+    from stm32logger.i18n import STRINGS
+
+    root = os.path.join(os.path.dirname(__file__), "..")
+    for lang in ("tr", "en"):
+        assert [k for k, _ in guide.topics(lang)] == guide.TOPICS
+        for name in guide.image_names():
+            assert os.path.exists(os.path.join(root, "assets", "help", lang, f"{name}.png")), (lang, name)
+        for key in guide.TOPICS:
+            html = guide.body_html(lang, key, 600)
+            assert "{img:" not in html and len(html) > 200
+    assert set(STRINGS["tr"]) == set(STRINGS["en"])
+
+
+def test_update_version_compare():
+    from stm32logger import system
+
+    assert system._vtuple("v2.1.0") < system._vtuple("2.10.0")
+    assert system._vtuple("2.1.0") == system._vtuple("v2.1.0")
+    assert "issues/new" in system.issue_url("en")
+
+
+# ---------------------------------------------------------------- v2.1 güvenlik / dayanıklılık
+class _FakeSerial:
+    """Verilen parçaları gönderir; die=True ise sonra USB çekilmiş gibi hata verir."""
+
+    def __init__(self, chunks, die=False):
+        self.chunks = list(chunks)
+        self.die = die
+        self.closed = False
+
+    @property
+    def in_waiting(self):
+        return len(self.chunks[0]) if self.chunks else 0
+
+    def read(self, n=1):
+        if self.closed:
+            raise OSError("closed")
+        if self.chunks:
+            return self.chunks.pop(0)
+        if self.die:
+            raise OSError("device removed")
+        time.sleep(0.01)
+        return b""
+
+    def write(self, d):
+        return len(d)
+
+    def close(self):
+        self.closed = True
+
+
+def _wait(cond, timeout=10):
+    t = time.time()
+    while not cond() and time.time() - t < timeout:
+        time.sleep(0.02)
+    return cond()
+
+
+def test_parser_redos_and_limits():
+    from stm32logger.parser import MAX_FIELDS, MAX_LINE
+
+    t = time.perf_counter()
+    for bad in ("a" * 60000, "A" + "a." * 30000, "x" + " a" * 30000, "Z" + "a" * (MAX_LINE - 1)):
+        assert parse_line(bad).kind == "text"
+    assert time.perf_counter() - t < 0.5            # eski sürümde 60k harf ~50 sn donduruyordu
+    v = parse_line("1,1e999,-1e999,3").values         # taşan sayı inf değil NaN olur
+    assert v[0] == 1 and v[1] != v[1] and v[2] != v[2] and v[3] == 3
+    assert parse_line(",".join(["1"] * (MAX_FIELDS + 5))).kind == "text"
+    p = parse_line(" ".join(f"k{i}:{i}" for i in range(200)))
+    assert len(p.named) == MAX_FIELDS
+
+
+def test_channel_cap():
+    from stm32logger.session import MAX_CHANNELS
+
+    s = Session()
+    for i in range(100):
+        s.add(float(i), parse_line(f"A{i}:1 B{i}:2"))
+    s.finish("t")
+    assert len(s.channels) == MAX_CHANNELS and s.dropped_channels > 0
+    st = s.channel_stats()
+    assert st[0]["count"] == 1 and st[0]["min"] == 1.0
+
+
+def test_engine_reconnect_and_lost_session():
+    first = _FakeSerial([b"0,10\n1,11\n2,12\n3,13\n4,1"], die=True)
+    second = _FakeSerial([b"0,20\n1,21\n2,22\n"])
+    opened = []
+
+    def reopen():
+        opened.append(1)
+        if len(opened) < 2:
+            raise OSError("not yet")
+        return second
+
+    eng = Engine(first, mode="live", session_factory=lambda: Session(mode="live"), reopen=reopen)
+    eng.start()
+    events = []
+
+    def got(kind):
+        try:
+            while True:
+                events.append(eng.events_q.get_nowait()[0])
+        except Exception:
+            pass
+        return kind in events
+
+    assert _wait(lambda: got("reconnected"), 10)
+    assert "lost" in events and "disconnected" not in events
+    lost = eng.done_q.get(timeout=2)
+    assert lost.finish_reason == "lost" and lost.n == 4 and lost.bad_lines == 1   # yarım "4,1" atıldı
+    assert _wait(lambda: eng.current.n == 3)
+    eng.stop()
+    assert eng.ser is second
+
+
+def test_engine_live_segment_and_hex_and_raw_rotation():
+    d = tempfile.mkdtemp()
+    raw = os.path.join(d, "ham.txt")
+    data = b"".join(f"{i},{i}\n".encode() for i in range(250))
+    ser = _FakeSerial([data[i:i + 100] for i in range(0, len(data), 100)])
+    eng = Engine(ser, mode="live", session_factory=lambda: Session(mode="live"), raw_path=raw,
+                 segment_rows=100, raw_max_bytes=600)
+    eng.hex_on = True
+    eng.start()
+    assert _wait(lambda: eng.total_lines >= 250)
+    time.sleep(0.2)
+    eng.stop()
+    segs = []
+    while not eng.done_q.empty():
+        segs.append(eng.done_q.get())
+    assert [s.n for s in segs][:2] == [100, 100] and segs[0].finish_reason == "segment"
+    assert sum(s.n for s in segs) == 250
+    parts = sorted(f for f in os.listdir(d) if f.startswith("ham"))
+    assert len(parts) >= 2
+    assert b"".join(open(os.path.join(d, f), "rb").read() for f in
+                    ["ham.txt"] + [f"ham_part{k}.txt" for k in range(2, len(parts) + 1)]) == data
+    assert b"".join(eng.hex) == data
+
+
+def test_engine_raw_write_error_reported():
+    class BadFile:
+        def write(self, d):
+            raise OSError("disk full")
+
+        def close(self):
+            pass
+
+    eng = Engine(_FakeSerial([]), mode="live", session_factory=Session)
+    eng.raw_path = "x.txt"
+    eng._raw = BadFile()
+    eng._write_raw(b"abc")
+    assert eng._raw is None
+    assert eng.events_q.get_nowait()[1].startswith("raw:")
+
+
+def test_segment_keeps_header_and_seq():
+    data = b"seq,temp,hum\n" + b"".join(f"{i},{i},{i * 2}\n".encode() for i in range(25) if i != 14)
+    eng = Engine(_FakeSerial([data]), mode="live", session_factory=lambda: Session(mode="live"), segment_rows=10)
+    eng.start()
+    assert _wait(lambda: eng.total_lines >= 25)
+    time.sleep(0.2)
+    eng.stop()
+    segs = []
+    while not eng.done_q.empty():
+        segs.append(eng.done_q.get())
+    assert all(s.channels == ["temp", "hum"] for s in segs)
+    assert [g.missing for s in segs for g in s.gaps] == [1]       # 14 eksik: bölme sonrasında da yakalandı
+
+
+def test_lost_junk_does_not_mark_next_session():
+    first = _FakeSerial([b"\x00\xff"], die=True)
+    second = _FakeSerial([b"START,3\n0,1\n1,2\n2,3\nEND,3\n"])
+    eng = Engine(first, mode="dma", session_factory=lambda: Session(mode="dma"), reopen=lambda: second)
+    eng.start()
+    s = eng.done_q.get(timeout=10)
+    eng.stop()
+    assert s.n == 3 and s.bad_lines == 0 and s.integrity_ok

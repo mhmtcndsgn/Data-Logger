@@ -126,7 +126,19 @@ QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 QStatusBar {{ background: {BG_PANEL}; border-top: 1px solid {BORDER}; color: {MUTED}; }}
 QStatusBar QLabel {{ background: transparent; color: {MUTED}; padding: 0 6px; }}
 QStatusBar::item {{ border: none; }}
-QMenu {{ background: {BG_RAISED}; border: 1px solid {BORDER}; }}
+QMenu {{ background: {BG_RAISED}; border: 1px solid {BORDER}; padding: 4px; }}
+QMenu::item {{ padding: 7px 22px 7px 14px; border-radius: 4px; }}
+QMenu::separator {{ height: 1px; background: {BORDER}; margin: 4px 8px; }}
+QToolButton#HelpBtn {{ background: {BG_RAISED}; border: 1px solid {BORDER}; border-radius: 15px;
+    min-width: 28px; min-height: 28px; max-width: 28px; max-height: 28px; font-weight: 700; font-size: 11pt; color: {BLUE_TXT}; }}
+QToolButton#HelpBtn:hover {{ border-color: {BLUE_HI}; }}
+QToolButton#HelpBtn::menu-indicator {{ image: none; width: 0; }}
+QListWidget {{ background: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 10px; padding: 6px; }}
+QListWidget::item {{ padding: 9px 10px; border-radius: 6px; color: {MUTED}; }}
+QListWidget::item:selected {{ background: {BLUE}; color: white; }}
+QListWidget::item:hover:!selected {{ background: #1a2130; color: {TEXT}; }}
+QTextBrowser {{ background: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 10px; padding: 10px 16px; }}
+QScrollArea QLabel {{ background: {BG_PLOT}; }}
 QMenu::item:selected {{ background: {BLUE}; }}
 """
 

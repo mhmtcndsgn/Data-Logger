@@ -24,6 +24,7 @@ NAN = float("nan")
 FAST_SEQ_ROWS = 3      # ilk 3 satır ardışıksa hemen karar ver
 SLOW_SEQ_ROWS = 5      # değilse 5 satıra bak (bağlanınca yarım gelen ilk satır vb.)
 LOCK_COLS_AFTER = 10   # bu kadar düzgün satırdan sonra sütun sayısı sabitlenir
+MAX_CHANNELS = 64      # bundan fazla kanal açılmaz (bozuk "isim:değer" akışı belleği şişirmesin)
 _INT_LIMIT = 9.0e18
 
 
@@ -90,6 +91,7 @@ class Session:
         self.out_of_order = 0             # geri giden sıra numarası
         self.fixed_seq = 0                # bozuk gelip düzeltilen sıra numarası
         self.bad_lines = 0                # bozuk satır (yanlış sütun sayısı vb.)
+        self.dropped_channels = 0         # MAX_CHANNELS aşıldığı için alınmayan kanal değeri
         self.expected: int | None = None  # START,N
         self.end_count: int | None = None  # END,N
         self.saw_start = False
@@ -98,6 +100,26 @@ class Session:
         self.bytes = 0
         self.lines = 0
         self.finish_reason = ""
+        self.saved_path: str | None = None   # başarıyla kaydedildiği dosya (arayüz doldurur)
+        self.saved_n = 0                     # o kayıtta dosyaya yazılan satır sayısı
+        self.exporting = 0                   # sürmekte olan kayıt işi sayısı
+
+    def continue_from(self, old: "Session", keep_seq: bool) -> None:
+        """Bölünen (segment) ya da kopup yeniden bağlanan kayıtta kanal adları/sütunlar aynı kalsın.
+
+        keep_seq=True: sıra numarası kaldığı yerden devam eder (bölme sınırındaki kayıp da yakalanır).
+        Bağlantı koptuysa kart yeniden başlamış olabilir; o durumda sıra kontrolü sıfırdan başlar.
+        """
+        self.header = list(old.header) if old.header else None
+        if self.seq_mode == "auto" and old.has_seq is not None:
+            self.has_seq = old.has_seq
+        self._ncols = old._ncols
+        self._ncols_seen, self._ncols_last = old._ncols_seen, old._ncols_last
+        for name in old.channels:
+            self._ensure(name)
+        if keep_seq:
+            self._last_seq = old._last_seq
+            self._seq_off = old._seq_off
 
     # ------------------------------------------------------------------ ekleme
     def add(self, t: float, p: ParsedLine) -> None:
@@ -175,6 +197,9 @@ class Session:
         try:
             return self.channels.index(name)
         except ValueError:
+            if len(self.channels) >= MAX_CHANNELS:
+                self.dropped_channels += 1
+                return -1
             self.channels.append(name)
             col = array("d", [NAN]) * self.n if self.n else array("d")
             self.cols.append(col)
@@ -188,7 +213,9 @@ class Session:
         seq_val = None
         if p.named is not None:
             for name, v in p.named.items():
-                row[self._ensure(name)] = v
+                i = self._ensure(name)
+                if i >= 0:
+                    row[i] = v
         else:
             vals = p.values
             # Sütun sayısı sabitlendikten sonra farklı uzunluktaki satır = bozuk (birleşmiş/yarım satır)
@@ -215,6 +242,8 @@ class Session:
                     idx = i
                 else:
                     idx = self._ensure(hdr[i] if hdr else self._default_name(i))
+                    if idx < 0:
+                        break
                 row[idx] = v
             if self._ncols is None:
                 n_fields = len(p.values)
@@ -320,18 +349,20 @@ class Session:
         return bisect_left(self.t_host, t0)
 
     def channel_stats(self, n: int | None = None) -> list[dict]:
+        import numpy as np
+
         n = self.n if n is None else n
         out = []
         for name, col in zip(self.channels, self.cols):
-            vals = [v for v in col[:n] if v == v]
-            if not vals:
+            a = np.frombuffer(col[:n], dtype=np.float64) if n else np.empty(0)
+            a = a[np.isfinite(a)]
+            cnt = int(a.size)
+            if not cnt:
                 out.append({"name": name, "count": 0})
                 continue
-            cnt = len(vals)
-            mean = math.fsum(vals) / cnt
-            var = math.fsum((v - mean) ** 2 for v in vals) / cnt if cnt > 1 else 0.0
-            out.append({"name": name, "count": cnt, "min": min(vals), "max": max(vals),
-                        "mean": mean, "std": math.sqrt(var)})
+            mean = float(a.mean())
+            out.append({"name": name, "count": cnt, "min": float(a.min()), "max": float(a.max()),
+                        "mean": mean, "std": float(a.std()) if cnt > 1 else 0.0})
         return out
 
     def duration_s(self) -> float:

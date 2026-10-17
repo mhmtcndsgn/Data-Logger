@@ -4,8 +4,11 @@ from __future__ import annotations
 import collections
 import datetime as _dt
 import html
+import json
 import os
 import queue
+import shutil
+import sys
 import threading
 import time
 from bisect import bisect_left
@@ -13,13 +16,16 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QSettings, QStandardPaths, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QIcon, QIntValidator, QPixmap, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QEvent, QEventLoop, QSettings, QStandardPaths, Qt, QTimer, QUrl
+from PySide6.QtGui import (QAction, QDesktopServices, QFont, QFontDatabase, QIcon, QIntValidator, QKeySequence, QPixmap,
+                           QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-                               QProgressBar, QPushButton, QScrollArea, QSplitter, QVBoxLayout, QWidget)
+                               QProgressBar, QProgressDialog, QPushButton, QScrollArea, QSplitter, QVBoxLayout,
+                               QWidget)
 
 from .. import APP_NAME, ORG_NAME, __version__
+from .. import system
 from ..engine import DEMO_PORT, Engine, list_ports, open_port
 from ..exporter import FORMATS, default_filename, export_session
 from ..i18n import T
@@ -31,6 +37,23 @@ ASSETS = Path(__file__).resolve().parent.parent.parent / "assets"
 BAUDS = ["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600", "1000000", "2000000"]
 WINDOWS = [10, 30, 60, 300, 0]  # sn, 0 = tümü
 TERM_MAX_PER_TICK = 400
+HEX_MAX_PER_TICK = 4096      # HEX görünümde bir seferde en fazla bu kadar bayt gösterilir
+HISTORY_MAX = 30
+DISK_LOW_MB = 500
+
+
+def _tip(text: str) -> str:
+    """Araç ipucu: karttan/USB'den gelen metin HTML olarak yorumlanmasın."""
+    return "<p>" + html.escape(str(text)) + "</p>"
+
+
+def _hex_lines(data: bytes) -> list[str]:
+    out = []
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        out.append(f"{chunk.hex(' ').upper():<47}  |{asc}|")
+    return out
 
 
 def _fmt_dur(sec: float) -> str:
@@ -48,8 +71,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = QSettings(ORG_NAME, "DataLogger")
-        self.lang = str(self.settings.value("lang", "tr"))
+        self.lang = self._sv("lang", "tr")
+        if self.lang not in ("tr", "en"):
+            self.lang = "tr"
         self.t = T(self.lang)
+        try:
+            self._history = [str(x) for x in json.loads(self._sv("history", "[]"))][-HISTORY_MAX:]
+        except (ValueError, TypeError):
+            self._history = []
+        self._hist_pos = len(self._history)
 
         self.engine: Engine | None = None
         self.view: Session | None = None          # ekranda gösterilen oturum
@@ -58,6 +88,7 @@ class MainWindow(QMainWindow):
         self._export_q: queue.SimpleQueue = queue.SimpleQueue()
         self._export_threads: list[threading.Thread] = []
         self._reserved: set[str] = set()   # yazılmakta olan dosyalar (aynı ada iki kayıt olmasın)
+        self._unsaved: list[Session] = []   # biten ama kaydedilmemiş kayıtlar (kapatırken sorulur)
         self._rate = collections.deque()
         self._conn_t0 = 0.0
         self._conn_info = ("", 0, "live")
@@ -74,7 +105,7 @@ class MainWindow(QMainWindow):
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
         self.resize(1360, 860)
-        self.setMinimumSize(1080, 700)
+        self.setMinimumSize(960, 620)
 
         self._build()
         guard_wheel(self.port_cb, self.baud_cb, self.fs_spin, self.seq_cb, self.idle_spin,
@@ -92,6 +123,18 @@ class MainWindow(QMainWindow):
         self.plot_timer.start()
         self.port_timer = QTimer(self, interval=2000, timeout=lambda: self._refresh_ports(silent=True))
         self.port_timer.start()
+
+        self._help_dlg = None
+        self._bg_q: queue.SimpleQueue = queue.SimpleQueue()
+        self.addAction(self.act_guide)   # F1 menü kapalıyken de çalışsın
+        for keys, fn in ((("Ctrl+S",), self._save_as), (("Ctrl+O",), self._open_saved_file),
+                         (("F5",), self._toggle_connect), (("Ctrl+L",), self.term.clear)):
+            act = QAction(self, triggered=fn)
+            act.setShortcuts([QKeySequence(k) for k in keys])
+            act.setShortcutContext(Qt.WindowShortcut)
+            self.addAction(act)
+        if not any(f in sys.argv for f in ("--selftest", "--no-first-run")):
+            QTimer.singleShot(500, self._first_run)
 
     # ================================================================ ARAYÜZ
     def _build(self) -> None:
@@ -139,6 +182,30 @@ class MainWindow(QMainWindow):
         self.lang_cb.currentIndexChanged.connect(lambda _: self._set_lang(self.lang_cb.currentData()))
         ver = QLabel(f"v{__version__}")
         ver.setObjectName("Version")
+        from PySide6.QtWidgets import QMenu, QToolButton
+
+        self.btn_help = QToolButton()
+        self.btn_help.setObjectName("HelpBtn")
+        self.btn_help.setText("?")
+        self.btn_help.setCursor(Qt.PointingHandCursor)
+        self.btn_help.setPopupMode(QToolButton.InstantPopup)
+        self.help_menu = QMenu(self.btn_help)
+        self.act_guide = QAction(self.help_menu, triggered=lambda: self.show_help())
+        self.act_guide.setShortcut(QKeySequence("F1"))
+        self.act_updates = QAction(self.help_menu, triggered=self._check_updates)
+        self.act_report = QAction(self.help_menu, triggered=self._report_issue)
+        self.act_about = QAction(self.help_menu, triggered=self._show_about)
+        self.act_reset = QAction(self.help_menu, triggered=self._reset_settings)
+        self.help_menu.addAction(self.act_guide)
+        self.help_menu.addSeparator()
+        self.help_menu.addAction(self.act_updates)
+        self.help_menu.addAction(self.act_report)
+        self.help_menu.addAction(self.act_reset)
+        self.help_menu.addSeparator()
+        self.help_menu.addAction(self.act_about)
+        self.btn_help.setMenu(self.help_menu)
+        lay.addWidget(self.btn_help)
+        lay.addSpacing(6)
         lay.addWidget(self.lbl_lang)
         lay.addWidget(self.lang_cb)
         lay.addSpacing(10)
@@ -179,6 +246,8 @@ class MainWindow(QMainWindow):
         c.add(self.seg_mode)
         self.lbl_mode_hint = hint_label()
         c.add(self.lbl_mode_hint)
+        self.chk_reconnect = QCheckBox()
+        c.add(self.chk_reconnect)
         c.lay.addSpacing(6)
         self.btn_connect = QPushButton()
         self.btn_connect.setObjectName("Primary")
@@ -275,6 +344,7 @@ class MainWindow(QMainWindow):
         bl = QHBoxLayout(self.banner)
         bl.setContentsMargins(14, 8, 8, 8)
         self.banner_lbl = QLabel()
+        self.banner_lbl.setTextFormat(Qt.PlainText)
         self.banner_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.banner_open = QPushButton()
         self.banner_open.setObjectName("Link")
@@ -350,6 +420,8 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(12, 10, 12, 12)
         v.setSpacing(6)
         h = self.term_hdr = PanelHeader()
+        self.chk_hex = h.add(QCheckBox())
+        self.chk_hex.toggled.connect(self._on_hex_toggled)
         self.chk_pause = h.add(QCheckBox())
         self.btn_clear = h.add(QPushButton())
         self.btn_clear.clicked.connect(lambda: self.term.clear())
@@ -370,6 +442,8 @@ class MainWindow(QMainWindow):
 
         self.send_edit = QLineEdit()
         self.send_edit.returnPressed.connect(self._send)
+        self.send_edit.installEventFilter(self)       # ↑ / ↓ komut geçmişi
+        self.chk_hex_send = QCheckBox()
         self.eol_cb = QComboBox()
         self.eol_cb.addItem("\\r\\n", "\r\n")
         self.eol_cb.addItem("\\n", "\n")
@@ -377,7 +451,7 @@ class MainWindow(QMainWindow):
         self.btn_send = QPushButton()
         self.btn_send.setObjectName("Accent")
         self.btn_send.clicked.connect(self._send)
-        v.addLayout(hrow(self.send_edit, self.eol_cb, self.btn_send))
+        v.addLayout(hrow(self.send_edit, self.chk_hex_send, self.eol_cb, self.btn_send))
         return panel
 
     def _build_statusbar(self) -> None:
@@ -401,6 +475,14 @@ class MainWindow(QMainWindow):
         self.lbl_title.setText(t("title_b"))
         self.setWindowTitle(t("app_name"))
         self.lbl_lang.setText(t("language"))
+        self.btn_help.setToolTip(t("help_btn") + "  (F1)")
+        self.act_guide.setText(t("menu_guide"))
+        self.act_updates.setText(t("menu_updates"))
+        self.act_report.setText(t("menu_report"))
+        self.act_about.setText(t("menu_about"))
+        self.act_reset.setText(t("menu_reset"))
+        if getattr(self, "_help_dlg", None) is not None:
+            self._help_dlg.set_lang(self.lang)
         self.card_conn.title.setText(t("card_conn"))
         self.lbl_port.setText(t("port"))
         self.btn_refresh.setToolTip(t("refresh"))
@@ -408,6 +490,9 @@ class MainWindow(QMainWindow):
         self.lbl_mode.setText(t("mode"))
         self.seg_mode.set_texts({"live": t("mode_live"), "dma": t("mode_dma")})
         self.lbl_mode_hint.setText(t("mode_" + self.seg_mode.value() + "_hint"))
+        self.chk_reconnect.setText(t("autoreconnect"))
+        self.chk_reconnect.setToolTip(t("autoreconnect_tip"))
+        self.btn_connect.setToolTip("F5")
         self._style_connect_button()
 
         self.card_data.title.setText(t("card_data"))
@@ -432,8 +517,10 @@ class MainWindow(QMainWindow):
         self.chk_raw.setText(t("rawbackup"))
         self.chk_raw.setToolTip(t("rawbackup_tip"))
         self.btn_save_as.setText(t("save_now"))
+        self.btn_save_as.setToolTip("Ctrl+S")
         self.btn_open_folder.setText(t("open_folder"))
         self.btn_open_saved.setText(t("open_saved"))
+        self.btn_open_saved.setToolTip("Ctrl+O")
 
         self.tile_rows.label.setText(t("st_rows").upper())
         self.tile_rate.label.setText(t("st_rate").upper())
@@ -454,8 +541,14 @@ class MainWindow(QMainWindow):
 
         self.term_hdr.title.setText(t("terminal"))
         self.chk_pause.setText(t("pause"))
+        self.chk_hex.setText(t("hex_view"))
+        self.chk_hex.setToolTip(t("hex_view_tip"))
+        self.chk_hex_send.setText(t("hex_send"))
+        self.chk_hex_send.setToolTip(t("hex_send_tip"))
         self.btn_clear.setText(t("clear"))
+        self.btn_clear.setToolTip("Ctrl+L")
         self.send_edit.setPlaceholderText(t("send_placeholder"))
+        self.send_edit.setToolTip(t("history_tip"))
         self.btn_send.setText(t("send"))
         self.eol_cb.setItemText(2, t("eol_none"))
         self.banner_open.setText(t("open_file"))
@@ -481,31 +574,62 @@ class MainWindow(QMainWindow):
         docs = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or str(Path.home())
         return os.path.join(docs, "Data Logger")
 
+    def _sv(self, key: str, default, kind=str):
+        """Ayarı güvenle okur: bozuk/elle değiştirilmiş değer uygulamayı çökertmez."""
+        try:
+            v = self.settings.value(key, default)
+            if v is None or v == "":
+                return default
+            if kind is bool:
+                return str(v).lower() == "true"
+            return kind(v)
+        except (TypeError, ValueError):
+            return default
+
     def _load_settings(self) -> None:
-        s = self.settings
-        self.baud_cb.setCurrentText(str(s.value("baud", "115200")))
-        self.seg_mode.set_value(str(s.value("mode", "dma")))
-        self.fs_spin.setValue(float(s.value("fs", 0) or 0))
-        i = self.seq_cb.findData(str(s.value("seq", "auto")))
-        self.seq_cb.setCurrentIndex(max(0, i))
-        self.idle_spin.setValue(float(s.value("idle", 1.0) or 1.0))
-        self.seg_fmt.set_value(str(s.value("fmt", "xlsx")))
-        self.folder_edit.setText(str(s.value("folder", "") or self._default_folder()))
-        self.prefix_edit.setText(str(s.value("prefix", "") or self.t("default_prefix")))
-        self.chk_auto.setChecked(str(s.value("autosave", "true")).lower() == "true")
-        self.chk_raw.setChecked(str(s.value("raw", "true")).lower() == "true")
-        i = self.x_cb.findData(str(s.value("xaxis", "auto")))
-        self.x_cb.setCurrentIndex(max(0, i))
-        i = self.win_cb.findData(int(s.value("window", 30) or 0))
+        sv = self._sv
+        self.baud_cb.setCurrentText(str(sv("baud", 115200, int)))
+        self.seg_mode.set_value(sv("mode", "dma") if sv("mode", "dma") in ("live", "dma") else "dma")
+        self.fs_spin.setValue(sv("fs", 0.0, float))
+        self.seq_cb.setCurrentIndex(max(0, self.seq_cb.findData(sv("seq", "auto"))))
+        self.idle_spin.setValue(sv("idle", 1.0, float))
+        self.seg_fmt.set_value(sv("fmt", "xlsx") if sv("fmt", "xlsx") in FORMATS else "xlsx")
+        self.folder_edit.setText(sv("folder", "") or self._default_folder())
+        self.prefix_edit.setText(sv("prefix", "") or self.t("default_prefix"))
+        self.chk_auto.setChecked(sv("autosave", True, bool))
+        self.chk_raw.setChecked(sv("raw", True, bool))
+        self.chk_reconnect.setChecked(sv("reconnect", True, bool))
+        self.chk_hex.setChecked(sv("hex", False, bool))
+        self.x_cb.setCurrentIndex(max(0, self.x_cb.findData(sv("xaxis", "auto"))))
+        i = self.win_cb.findData(sv("window", 30, int))
         self.win_cb.setCurrentIndex(i if i >= 0 else 1)
-        i = self.eol_cb.findData(str(s.value("eol", "\r\n")))
-        self.eol_cb.setCurrentIndex(max(0, i))
-        geo = s.value("geometry")
-        if geo is not None:
-            self.restoreGeometry(geo)
-        sp = s.value("splitter")
-        if sp is not None:
-            self.splitter.restoreState(sp)
+        self.eol_cb.setCurrentIndex(max(0, self.eol_cb.findData(sv("eol", "\r\n"))))
+        try:
+            geo = self.settings.value("geometry")
+            if geo is not None:
+                self.restoreGeometry(geo)
+            sp = self.settings.value("splitter")
+            if sp is not None:
+                self.splitter.restoreState(sp)
+        except (TypeError, ValueError):
+            pass
+
+    def _reset_settings(self) -> None:
+        t = self.t
+        if self.engine is not None:
+            self._msg("info", t("menu_reset"), t("reset_busy"))
+            return
+        if self._ask(t("menu_reset"), t("reset_ask"), t("menu_reset")) is not True:
+            return
+        self.settings.clear()
+        self.settings.setValue("help_seen", "true")
+        self.settings.setValue("unblock_asked", "true")
+        self._history, self._hist_pos = [], 0
+        self._load_settings()
+        self.resize(1360, 860)
+        self.splitter.setSizes([480, 260])
+        self._set_lang("tr" if self.lang_cb.currentIndex() == 0 else "en")
+        self._log(t("reset_done"), "ok")
 
     def _save_settings(self) -> None:
         s = self.settings
@@ -520,6 +644,9 @@ class MainWindow(QMainWindow):
         s.setValue("prefix", self.prefix_edit.text())
         s.setValue("autosave", "true" if self.chk_auto.isChecked() else "false")
         s.setValue("raw", "true" if self.chk_raw.isChecked() else "false")
+        s.setValue("reconnect", "true" if self.chk_reconnect.isChecked() else "false")
+        s.setValue("hex", "true" if self.chk_hex.isChecked() else "false")
+        s.setValue("history", json.dumps(self._history[-HISTORY_MAX:], ensure_ascii=False))
         s.setValue("xaxis", self.x_cb.currentData())
         s.setValue("window", self.win_cb.currentData())
         s.setValue("eol", self.eol_cb.currentData())
@@ -543,13 +670,13 @@ class MainWindow(QMainWindow):
         self._port_sig = sig
         cur = self.port_cb.currentData()
         if initial:
-            cur = str(self.settings.value("port", "") or "")
+            cur = self._sv("port", "")
         self.port_cb.blockSignals(True)
         self.port_cb.clear()
         for dev, desc, is_stm in ports:
             label = dev if desc == dev or desc in ("n/a", "") else f"{dev} — {desc}"
             self.port_cb.addItem(("★ " if is_stm else "") + label, dev)
-            self.port_cb.setItemData(self.port_cb.count() - 1, desc, Qt.ToolTipRole)
+            self.port_cb.setItemData(self.port_cb.count() - 1, _tip(desc), Qt.ToolTipRole)
         self.port_cb.addItem(self.t("demo_port"), DEMO_PORT)
         i = self.port_cb.findData(cur) if cur else -1
         if i < 0:
@@ -590,7 +717,9 @@ class MainWindow(QMainWindow):
         t = self.t
         port = self.port_cb.currentData()
         if not port:
-            QMessageBox.warning(self, t("err_title"), t("no_port"))
+            self._msg("warn", t("err_title"), t("no_port"))
+            return
+        if not self._confirm_discard():
             return
         try:
             baud = int(self.baud_cb.currentText() or 115200)
@@ -601,7 +730,7 @@ class MainWindow(QMainWindow):
             ser = open_port(port, baud, mode)
         except Exception as e:
             self._log(t("msg_open_err", err=e), "error")
-            QMessageBox.critical(self, t("err_title"), t("msg_open_err", err=e))
+            self._msg("error", t("err_title"), t("msg_open_err", err=e))
             return
 
         raw_path = None
@@ -620,8 +749,13 @@ class MainWindow(QMainWindow):
             return Session(mode=mode, seq_mode=seq_mode, channel_prefix=prefix,
                            port=port_name, baud=baud, sample_rate=fs)
 
+        reopen = None
+        if self.chk_reconnect.isChecked() and port != DEMO_PORT:
+            reopen = lambda: open_port(port, baud, mode)  # noqa: E731
+
         self.engine = Engine(ser, mode=mode, session_factory=factory, raw_path=raw_path,
-                             idle_timeout=self.idle_spin.value())
+                             idle_timeout=self.idle_spin.value(), reopen=reopen)
+        self.engine.hex_on = self.chk_hex.isChecked()
         self.engine.start()
         self._conn_t0 = time.time()
         self._conn_info = (port_name, baud, mode)
@@ -636,6 +770,22 @@ class MainWindow(QMainWindow):
         self._log(t("msg_connected", port=port_name, baud=baud, mode=t("mode_" + mode)), "ok")
         if raw_path:
             self._log(t("msg_raw", path=raw_path), "muted")
+        self._check_disk(folder)
+
+    def _check_disk(self, folder: str) -> None:
+        p = os.path.abspath(folder)
+        while p and not os.path.exists(p):
+            parent = os.path.dirname(p)
+            if parent == p:
+                return
+            p = parent
+        try:
+            free_mb = shutil.disk_usage(p).free // (1024 * 1024)
+        except OSError:
+            return
+        if free_mb < DISK_LOW_MB:
+            self._log(self.t("disk_low", mb=_fmt_int(free_mb)), "warn")
+            self._show_banner(self.t("disk_low", mb=_fmt_int(free_mb)), "bad", show_open=False)
 
     def _disconnect(self, lost: str | None = None) -> None:
         eng = self.engine
@@ -663,7 +813,7 @@ class MainWindow(QMainWindow):
 
     def _set_controls_enabled(self, on: bool) -> None:
         for w in (self.port_cb, self.btn_refresh, self.baud_cb, self.seg_mode, self.fs_spin,
-                  self.seq_cb, self.btn_open_saved, self.chk_raw):
+                  self.seq_cb, self.btn_open_saved, self.chk_raw, self.chk_reconnect):
             w.setEnabled(on)
         self.idle_spin.setEnabled(on and self.seg_mode.value() == "dma")
         self.send_edit.setEnabled(not on)
@@ -673,6 +823,12 @@ class MainWindow(QMainWindow):
     # ================================================================ DÖNGÜ
     def _tick(self) -> None:
         self._drain_exports()
+        try:
+            while True:
+                fn, args = self._bg_q.get_nowait()
+                fn(*args)
+        except queue.Empty:
+            pass
         eng = self.engine
         if eng is not None:
             try:
@@ -681,13 +837,28 @@ class MainWindow(QMainWindow):
                     if kind == "disconnected":
                         self._disconnect(lost=msg or "?")
                         return
-                    if kind == "error" and msg.startswith("raw:"):
+                    if kind == "stopped":          # işlemci beklenmedik şekilde durdu
+                        self._disconnect(lost=msg or "processor")
+                        return
+                    if kind == "lost":
+                        self._log(self.t("msg_lost_retry", err=msg or "?"), "warn")
+                        self._set_status_dot(False)
+                    elif kind == "reconnected":
+                        self._log(self.t("msg_reconnected"), "ok")
+                        self._set_status_dot(True)
+                    elif kind == "raw_part":
+                        self._log(self.t("msg_raw_part", path=msg), "muted")
+                    elif kind == "error" and msg.startswith("raw:"):
                         self._log(self.t("msg_raw_err", err=msg[4:]), "error")
+                    elif kind == "error":
+                        self._log(msg, "error")
             except queue.Empty:
                 pass
             self._drain_done(eng)
             if not self.chk_pause.isChecked():
                 self._drain_terminal(eng)
+            if not self.chk_hex.isChecked() and eng.hex:
+                eng.hex.clear()
             cur = eng.current
             if cur is not self.view and (cur.n > 0 or cur.saw_start):
                 self.view = cur
@@ -700,7 +871,34 @@ class MainWindow(QMainWindow):
                 self._rate.popleft()
         self._update_stats()
 
+    def _on_hex_toggled(self, on: bool) -> None:
+        if self.engine is not None:
+            self.engine.hex_on = on
+            self.engine.hex.clear()
+
     def _drain_terminal(self, eng: Engine) -> None:
+        if self.chk_hex.isChecked():
+            eng.term.clear()
+            eng.term_dropped = 0
+            chunks = []
+            try:
+                while True:
+                    chunks.append(eng.hex.popleft())
+            except IndexError:
+                pass
+            if not chunks:
+                return
+            data = b"".join(chunks)
+            if len(data) > HEX_MAX_PER_TICK:
+                self._log(self.t("term_dropped", n=_fmt_int(len(data) - HEX_MAX_PER_TICK)) + " (byte)",
+                          "muted", stamp=False)
+                data = data[-HEX_MAX_PER_TICK:]
+            sb = self.term.verticalScrollBar()
+            at_bottom = sb.value() >= sb.maximum() - 4
+            self.term.appendPlainText("\n".join(_hex_lines(data)))
+            if at_bottom:
+                sb.setValue(sb.maximum())
+            return
         dq = eng.term
         if not dq:
             return
@@ -752,9 +950,15 @@ class MainWindow(QMainWindow):
             txt += "  ·  " + t("banner_bad_lines", b=_fmt_int(s.bad_lines))
             if state == "ok":
                 state = "bad"
+        if s.dropped_channels:
+            txt += "  ·  " + t("banner_dropped_ch")
         self._log(txt, {"ok": "ok", "bad": "error"}.get(state, "info"))
+        if s.finish_reason == "segment":
+            self._log(t("msg_segment", n=_fmt_int(s.n)), "info")
         self._banner_base = txt
-        if self.chk_auto.isChecked():
+        self._unsaved.append(s)
+        # Bölünen canlı kayıt ve kopan bağlantı: ekrandan gidecek veri kaybolmasın diye her zaman kaydedilir
+        if self.chk_auto.isChecked() or s.finish_reason in ("segment", "lost"):
             fmt = self.seg_fmt.value()
             folder = self.folder_edit.text().strip() or self._default_folder()
             path = self._unique(os.path.join(folder, default_filename(s, self.prefix_edit.text(), fmt)))
@@ -810,7 +1014,9 @@ class MainWindow(QMainWindow):
 
         if eng:
             receiving = eng.last_rx and (time.perf_counter() - eng.last_rx) < 0.4
-            if receiving:
+            if eng.reconnecting:
+                self.tile_status.set(t("status_reconnecting"), " ", th.YELLOW_TXT)
+            elif receiving:
                 self.tile_status.set(t("status_receiving"), " ", th.BLUE_TXT)
             elif self.view is not None and self.view is not eng.current and self.view.n:
                 self.tile_status.set(t("status_done"), " ", th.GREEN_TXT)
@@ -923,7 +1129,7 @@ class MainWindow(QMainWindow):
             c = self._curves.get(name)
             if c is None:
                 color = th.SERIES[i % len(th.SERIES)]
-                c = self.plot.plot(pen=pg.mkPen(color, width=1.6), name=name, connect="finite")
+                c = self.plot.plot(pen=pg.mkPen(color, width=1.6), name=html.escape(name), connect="finite")
                 c.setDownsampling(auto=True, method="peak")
                 c.setClipToView(True)
                 self._curves[name] = c
@@ -944,7 +1150,10 @@ class MainWindow(QMainWindow):
         from pyqtgraph.exporters import ImageExporter
 
         folder = self.folder_edit.text().strip() or self._default_folder()
-        os.makedirs(folder, exist_ok=True)
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            folder = str(Path.home())
         name = f"grafik_{_dt.datetime.now():%Y-%m-%d_%H-%M-%S}.png"
         path, _ = QFileDialog.getSaveFileName(self, self.t("save_png"), os.path.join(folder, name), "PNG (*.png)")
         if not path:
@@ -971,11 +1180,13 @@ class MainWindow(QMainWindow):
     def _export_async(self, s: Session, path: str, fmt: str) -> None:
         lang = self.lang
         self._reserved.add(os.path.normcase(path))
+        s.exporting += 1
 
         def job():
+            info = {}
             try:
-                export_session(s, path, fmt, lang)
-                self._export_q.put(("ok", path, s, path))
+                export_session(s, path, fmt, lang, info=info)
+                self._export_q.put(("ok", (path, info.get("rows", 0)), s, path))
             except Exception as e:  # noqa: BLE001
                 self._export_q.put(("err", f"{os.path.basename(path)}: {e}", s, path))
 
@@ -988,10 +1199,16 @@ class MainWindow(QMainWindow):
             while True:
                 kind, val, s, path = self._export_q.get_nowait()
                 self._reserved.discard(os.path.normcase(path))
+                s.exporting = max(0, s.exporting - 1)
                 if kind == "ok":
+                    val, rows = val
+                    s.saved_path = val
+                    s.saved_n = max(s.saved_n, rows)
+                    if s.n <= s.saved_n and s in self._unsaved:
+                        self._unsaved.remove(s)
                     self.last_saved = val
                     self.saved_btn.setText("💾 " + os.path.basename(val))
-                    self.saved_btn.setToolTip(val)
+                    self.saved_btn.setToolTip(_tip(val))
                     self.saved_btn.show()
                     self._log(self.t("msg_saved", path=val), "ok")
                     if s is self.banner_session and self.banner.isVisible():
@@ -1001,18 +1218,21 @@ class MainWindow(QMainWindow):
                                           state, show_open=True)
                 else:
                     self._log(self.t("msg_save_err", err=val), "error")
-                    QMessageBox.critical(self, self.t("err_title"), self.t("msg_save_err", err=val))
+                    self._msg("error", self.t("err_title"), self.t("msg_save_err", err=val))
         except queue.Empty:
             pass
 
     def _save_as(self) -> None:
         s = self.view
         if s is None or s.n == 0:
-            QMessageBox.information(self, APP_NAME, self.t("msg_nodata"))
+            self._msg("info", APP_NAME, self.t("msg_nodata"))
             return
         fmt = self.seg_fmt.value()
         folder = self.folder_edit.text().strip() or self._default_folder()
-        os.makedirs(folder, exist_ok=True)
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            folder = self._default_folder()
         filters = {"xlsx": "Excel (*.xlsx)", "csv": "CSV (*.csv)", "txt": "TXT (*.txt)"}
         order = [fmt] + [k for k in filters if k != fmt]
         path, chosen = QFileDialog.getSaveFileName(
@@ -1024,6 +1244,8 @@ class MainWindow(QMainWindow):
         if ext not in FORMATS:
             ext = next((k for k, f in filters.items() if f == chosen), fmt)
             path += FORMATS[ext]
+        if os.path.normcase(path) in self._reserved:    # aynı dosya şu an otomatik kaydediliyor
+            path = self._unique(path)
         self._export_async(s, path, ext)
 
     def _browse_folder(self) -> None:
@@ -1034,7 +1256,11 @@ class MainWindow(QMainWindow):
 
     def _open_folder(self) -> None:
         folder = self.folder_edit.text().strip() or self._default_folder()
-        os.makedirs(folder, exist_ok=True)
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            self._log(str(e), "error")
+            return
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def _open_path(self, path: str | None) -> None:
@@ -1044,6 +1270,8 @@ class MainWindow(QMainWindow):
     def _open_saved_file(self) -> None:
         from ..importer import load_file
 
+        if self.engine is not None or not self._confirm_discard():
+            return
         folder = self.folder_edit.text().strip() or self._default_folder()
         path, _ = QFileDialog.getOpenFileName(self, self.t("open_title"), folder, self.t("file_filter"))
         if not path:
@@ -1053,9 +1281,9 @@ class MainWindow(QMainWindow):
             s = load_file(path, channel_prefix=self.t("channel_prefix"))
         except Exception as e:  # noqa: BLE001
             QApplication.restoreOverrideCursor()
-            msg = self.t("msg_nodata") if str(e) == "no-data" else str(e)
+            msg = {"no-data": self.t("msg_nodata"), "too-big": self.t("file_too_big")}.get(str(e), str(e))
             self._log(self.t("msg_load_err", err=msg), "error")
-            QMessageBox.warning(self, self.t("err_title"), self.t("msg_load_err", err=msg))
+            self._msg("warn", self.t("err_title"), self.t("msg_load_err", err=msg))
             return
         QApplication.restoreOverrideCursor()
         self.view = s
@@ -1071,13 +1299,35 @@ class MainWindow(QMainWindow):
         if self.engine is None:
             return
         cmd = self.send_edit.text()
-        eol = self.eol_cb.currentData() or ""
+        if self.chk_hex_send.isChecked():
+            try:
+                data = bytes.fromhex(cmd.replace("0x", "").replace("0X", "").replace(",", " "))
+            except ValueError as e:
+                self._log(self.t("msg_hex_err", err=e), "error")
+                return
+            shown = data.hex(" ").upper() or "∅"
+        else:
+            data = (cmd + (self.eol_cb.currentData() or "")).encode("utf-8")
+            shown = cmd or "⏎"
         try:
-            self.engine.send((cmd + eol).encode("utf-8"))
-            self._log(self.t("msg_sent", cmd=cmd or "⏎"), "info")
+            self.engine.send(data)
+            self._log(self.t("msg_sent", cmd=shown), "info")
+            if cmd and (not self._history or self._history[-1] != cmd):
+                self._history.append(cmd)
+                del self._history[:-HISTORY_MAX]
+            self._hist_pos = len(self._history)
             self.send_edit.clear()
         except Exception as e:  # noqa: BLE001
             self._log(self.t("msg_send_err", err=e), "error")
+
+    def eventFilter(self, obj, ev) -> bool:
+        if obj is self.send_edit and ev.type() == QEvent.KeyPress and ev.key() in (Qt.Key_Up, Qt.Key_Down):
+            if self._history:
+                step = -1 if ev.key() == Qt.Key_Up else 1
+                self._hist_pos = max(0, min(len(self._history), self._hist_pos + step))
+                self.send_edit.setText(self._history[self._hist_pos] if self._hist_pos < len(self._history) else "")
+            return True
+        return super().eventFilter(obj, ev)
 
     def _log(self, text: str, level: str = "info", stamp: bool = True) -> None:
         color = {"info": th.BLUE_TXT, "ok": th.GREEN_TXT, "warn": th.YELLOW_TXT,
@@ -1096,12 +1346,241 @@ class MainWindow(QMainWindow):
         if level in ("ok", "error", "warn"):
             self.statusBar().showMessage(str(text), 6000)
 
-    # ================================================================ KAPANIŞ
+    # ================================================================ MESAJ KUTULARI
+    def _msg(self, kind: str, title: str, text: str) -> None:
+        """Düz metin mesaj kutusu (hata metnindeki dosya/port adları HTML olarak yorumlanmaz)."""
+        box = QMessageBox(self)
+        box.setIcon({"error": QMessageBox.Critical, "warn": QMessageBox.Warning}.get(kind, QMessageBox.Information))
+        box.setWindowTitle(title)
+        box.setTextFormat(Qt.PlainText)
+        box.setText(str(text))
+        box.exec()
+
+    def _ask(self, title: str, text: str, yes: str, alt: str | None = None):
+        """True = yes, "alt" = alternatif buton, None = iptal."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(title)
+        box.setTextFormat(Qt.PlainText)
+        box.setText(text)
+        b_yes = box.addButton(yes, QMessageBox.AcceptRole)
+        b_alt = box.addButton(alt, QMessageBox.DestructiveRole) if alt else None
+        b_no = box.addButton(self.t("cancel"), QMessageBox.RejectRole)
+        box.setDefaultButton(b_yes)
+        box.setEscapeButton(b_no)
+        box.exec()
+        c = box.clickedButton()
+        return True if c is b_yes else ("alt" if b_alt is not None and c is b_alt else None)
+
+    # ================================================================ KAYDEDİLMEMİŞ VERİ / KAPANIŞ
+    def _at_risk(self) -> list[Session]:
+        """Kaydedilmeden kaybolacak oturumlar.
+
+        Bir oturum, dosyaya yazılan satır sayısından (saved_n) fazla satırı varsa risktedir.
+        Bağlıyken ve otomatik kaydetme açıkken o anki kayıt, bağlantı kesilince zaten kaydedilir.
+        """
+        eng = self.engine
+        cands = list(self._unsaved)
+        if eng is not None and not self.chk_auto.isChecked():
+            cands.append(eng.current)
+        cands.append(self.view)
+        out, seen = [], set()
+        for s in cands:
+            if (s is None or id(s) in seen or s.mode == "file" or s.exporting or s.n <= s.saved_n
+                    or (eng is not None and s is eng.current and self.chk_auto.isChecked())):
+                continue
+            seen.add(id(s))
+            out.append(s)
+        self._unsaved = [s for s in self._unsaved if s.n > s.saved_n or s.exporting]
+        return out
+
+    def _confirm_discard(self) -> bool:
+        """Kaydedilmemiş veri varsa sorar. False = kullanıcı vazgeçti."""
+        risk = self._at_risk()
+        if not risk:
+            return True
+        t = self.t
+        ans = self._ask(t("unsaved_title"), t("unsaved_ask", k=len(risk), n=_fmt_int(sum(s.n for s in risk))),
+                        t("unsaved_save"), t("unsaved_discard"))
+        if ans is None:
+            return False
+        if ans is not True:
+            self._unsaved.clear()
+            for s in risk:
+                s.saved_n = s.n          # kullanıcı vazgeçti: tekrar sorulmasın
+            return True
+        if self.engine is not None and not self.chk_auto.isChecked():
+            self._disconnect()           # o anki kayıt tamamlansın (listeye girer), sonra hepsi kaydedilir
+        self._wait_exports()
+        fmt = self.seg_fmt.value()
+        folder = self.folder_edit.text().strip() or self._default_folder()
+        for s in self._at_risk():        # diyalog açıkken durum değişmiş olabilir: yeniden hesapla
+            path = self._unique(os.path.join(folder, default_filename(s, self.prefix_edit.text(), fmt)))
+            self._export_async(s, path, fmt)
+        self._wait_exports()
+        return not self._at_risk()
+
+    def _wait_exports(self) -> None:
+        alive = [x for x in self._export_threads if x.is_alive()]
+        if alive:
+            dlg = QProgressDialog(self.t("closing_wait"), None, 0, 0, self)
+            dlg.setWindowTitle(APP_NAME)
+            dlg.setWindowModality(Qt.WindowModal)
+            dlg.setCancelButton(None)
+            dlg.setMinimumDuration(0)
+            dlg.show()
+            while any(x.is_alive() for x in alive):
+                QApplication.processEvents(QEventLoop.ExcludeUserInputEvents, 50)
+                time.sleep(0.02)
+            dlg.close()
+        self._drain_exports()
+
+    # ================================================================ YARDIM / HAKKINDA
+    def show_help(self, topic: str | None = None) -> None:
+        from .help_dialog import HelpDialog
+
+        if self._help_dlg is None:
+            self._help_dlg = HelpDialog(self, self.lang, str(ASSETS / "help"))
+        if topic:
+            self._help_dlg.show_topic(topic)
+        self._help_dlg.show()
+        self._help_dlg.raise_()
+        self._help_dlg.activateWindow()
+
+    def _first_run(self) -> None:
+        s = self.settings
+        if system.should_offer_unblock() and str(s.value("unblock_asked", "false")) != "true":
+            s.setValue("unblock_asked", "true")
+            self._ask_unblock()
+        if str(s.value("help_seen", "false")) != "true":
+            s.setValue("help_seen", "true")
+            self.show_help("quickstart")
+
+    def _ask_unblock(self) -> None:
+        t = self.t
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(t("unblock_title"))
+        box.setText(t("unblock_ask"))
+        yes = box.addButton(t("unblock_yes"), QMessageBox.AcceptRole)
+        box.addButton(t("later"), QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is yes:
+            self._do_unblock()
+
+    def _do_unblock(self) -> None:
+        t = self.t
+
+        def done(res):
+            ok, fail, skipped = res
+            parts = [t("unblock_done", n=ok) if ok else t("unblock_none")]
+            if fail:
+                parts.append(t("unblock_fail", n=fail))
+            if skipped:
+                parts.append(t("unblock_skipped", n=skipped))
+            text = "\n\n".join(parts)
+            self._log(text.replace("\n\n", "  "), "warn" if (fail or skipped) else "ok")
+            self._msg("warn" if (fail or skipped) else "info", t("unblock_title"), text)
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+
+        def fin(fn):
+            def inner(arg):
+                QApplication.restoreOverrideCursor()
+                fn(arg)
+            return inner
+
+        self._run_bg(lambda: system.unblock(system.app_dir()), fin(done),
+                     fin(lambda e: self._msg("error", t("unblock_title"), str(e))))
+
+    def _verify_files(self) -> None:
+        t = self.t
+        self.statusBar().showMessage(t("verify_running"), 5000)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+
+        def done(r):
+            QApplication.restoreOverrideCursor()
+            if r["no_manifest"]:
+                self._msg("info", t("verify_btn"), t("verify_none"))
+                return
+
+            def lst(items, mark):
+                return [f"  {mark} {x}" for x in items]
+
+            if r["ok"] and not r["extra"]:
+                self._log(t("verify_ok", n=r["checked"]).replace("\n\n", " "), "ok")
+                self._msg("info", t("verify_btn"), t("verify_ok", n=r["checked"]))
+            elif r["ok"]:
+                items = "\n".join(lst(r["extra"][:15], "?") + (["  …"] if len(r["extra"]) > 15 else []))
+                self._log(t("verify_btn") + ": " + ", ".join(r["extra"][:15]), "warn")
+                self._msg("warn", t("verify_btn"), t("verify_ok_extra", n=r["checked"], m=len(r["extra"]), list=items))
+            else:
+                rows = lst(r["changed"], "≠") + lst(r["missing"], "−") + lst(r["extra"], "?")
+                items = "\n".join(rows[:20] + (["  …"] if len(rows) > 20 else []))
+                self._log(t("verify_btn") + ": " + "; ".join(rows[:20]), "error")
+                self._msg("error", t("verify_btn"), t("verify_bad", c=len(r["changed"]), mi=len(r["missing"]),
+                                                        e=len(r["extra"]), list=items))
+
+        def err(e):
+            QApplication.restoreOverrideCursor()
+            self._msg("error", t("verify_btn"), str(e))
+
+        self._run_bg(system.verify_install, done, err)
+
+    def _run_bg(self, fn, on_ok, on_err) -> None:
+        def job():
+            try:
+                res = fn()
+                self._bg_q.put((on_ok, (res,)))
+            except Exception as e:  # noqa: BLE001
+                self._bg_q.put((on_err, (e,)))
+
+        threading.Thread(target=job, name="bg", daemon=True).start()
+
+    def _check_updates(self) -> None:
+        t = self.t
+        self.statusBar().showMessage(t("upd_checking"), 5000)
+        self._log(t("upd_checking"), "info")
+
+        def ok(res):
+            if res["newer"]:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Information)
+                box.setWindowTitle(t("menu_updates"))
+                box.setText(t("upd_new", new=res["latest"], cur=__version__))
+                go = box.addButton(t("upd_open"), QMessageBox.AcceptRole)
+                box.addButton(t("later"), QMessageBox.RejectRole)
+                box.exec()
+                if box.clickedButton() is go:
+                    QDesktopServices.openUrl(QUrl(res["url"]))
+            else:
+                self._msg("info", t("menu_updates"), t("upd_latest", cur=__version__))
+
+        def err(e):
+            self._msg("warn", t("menu_updates"), t("upd_err", err=e))
+
+        self._run_bg(system.check_latest, ok, err)
+
+    def _report_issue(self) -> None:
+        QDesktopServices.openUrl(QUrl(system.issue_url(self.lang)))
+
+    def _show_about(self) -> None:
+        from .help_dialog import AboutDialog
+
+        can = sys.platform == "win32" and getattr(sys, "frozen", False)
+        has_manifest = getattr(sys, "frozen", False) and os.path.exists(system.manifest_path())
+        AboutDialog(self, self.lang, str(ASSETS / "icon.png"), can, self._do_unblock, self._check_updates,
+                    on_verify=self._verify_files if has_manifest else None).exec()
+
     def closeEvent(self, ev) -> None:
+        if not self._confirm_discard():
+            ev.ignore()
+            return
         if self.engine is not None:
             self._disconnect()
-        for t in self._export_threads:
-            t.join(timeout=60)
-        self._drain_exports()
+        self._wait_exports()
+        if self._at_risk() and not self._confirm_discard():   # otomatik kayıt başarısız olduysa tekrar sor
+            ev.ignore()
+            return
         self._save_settings()
         super().closeEvent(ev)

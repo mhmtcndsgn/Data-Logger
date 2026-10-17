@@ -31,12 +31,23 @@ from .parser import parse_line
 from .session import Session
 
 DEMO_PORT = "DEMO"
+MAX_CARRY = 16384                 # satır sonu gelmeden biriken en fazla bayt (sonra satır sayılır)
+TERM_LINE_MAX = 2000              # terminalde gösterilen satır uzunluğu sınırı
+LIVE_SEGMENT_ROWS = 1_000_000     # canlı modda bu kadar satırda bir dosya bölünür (bellek sınırı)
+RAW_MAX_BYTES = 256 * 1024 * 1024  # ham yedek bu boyuta ulaşınca yeni parçaya geçilir
+HEX_CHUNK_MAX = 4096              # HEX görünüm için saklanan en büyük parça
+_LOST = object()                  # okuyucudan işlemciye: "bağlantı koptu" işareti
 
 
 class Engine:
     def __init__(self, ser, *, mode: str, session_factory: Callable[[], Session],
-                 raw_path: str | None = None, idle_timeout: float = 1.0):
+                 raw_path: str | None = None, idle_timeout: float = 1.0,
+                 reopen: Callable[[], object] | None = None, segment_rows: int = LIVE_SEGMENT_ROWS,
+                 raw_max_bytes: int = RAW_MAX_BYTES):
         self.ser = ser
+        self.reopen = reopen              # verilirse USB koparsa yeniden bağlanmayı dener
+        self.segment_rows = segment_rows
+        self.raw_max_bytes = raw_max_bytes
         self.mode = mode
         self.session_factory = session_factory
         self.idle_timeout = idle_timeout
@@ -47,6 +58,9 @@ class Engine:
         self.events_q: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
         self.term = collections.deque(maxlen=1500)
         self.term_dropped = 0
+        self.hex_on = False               # arayüz HEX görünümünü açınca True yapar
+        self.hex = collections.deque(maxlen=400)
+        self.reconnecting = False
 
         self.total_bytes = 0
         self.total_lines = 0
@@ -58,16 +72,13 @@ class Engine:
         self._reader = threading.Thread(target=self._read_loop, name="serial-reader", daemon=True)
         self._proc = threading.Thread(target=self._process_loop, name="processor", daemon=True)
         self._raw = None
+        self._raw_size = 0
+        self._raw_part = 1
 
     # ----------------------------------------------------------- yaşam döngüsü
     def start(self) -> None:
         if self.raw_path:
-            try:
-                os.makedirs(os.path.dirname(self.raw_path) or ".", exist_ok=True)
-                self._raw = open(self.raw_path, "ab", buffering=1024 * 1024)
-            except OSError as e:
-                self.events_q.put(("error", f"raw:{e}"))
-                self._raw = None
+            self._open_raw(self.raw_path)
         self._reader.start()
         self._proc.start()
 
@@ -87,6 +98,41 @@ class Engine:
     def running(self) -> bool:
         return not self._stop.is_set()
 
+    # ----------------------------------------------------------- ham yedek
+    def _open_raw(self, path: str) -> None:
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            self._raw = open(path, "ab", buffering=1024 * 1024)
+            self._raw_size = self._raw.tell()
+        except OSError as e:
+            self.events_q.put(("error", f"raw:{e}"))
+            self._raw = None
+
+    def _write_raw(self, data: bytes) -> None:
+        if self._raw_size + len(data) > self.raw_max_bytes and self._raw_size > 0:
+            try:
+                self._raw.close()
+            except OSError:
+                pass
+            self._raw = None
+            self._raw_part += 1
+            base, ext = os.path.splitext(self.raw_path)
+            path = f"{base}_part{self._raw_part}{ext}"
+            self._open_raw(path)
+            if self._raw is None:
+                return
+            self.events_q.put(("raw_part", path))
+        try:
+            self._raw.write(data)
+            self._raw_size += len(data)
+        except OSError as e:   # disk doldu, USB bellek çıkarıldı...: bir kez bildir, yedeği durdur
+            self.events_q.put(("error", f"raw:{e}"))
+            try:
+                self._raw.close()
+            except OSError:
+                pass
+            self._raw = None
+
     # ----------------------------------------------------------- okuyucu
     def _read_loop(self) -> None:
         ser = self.ser
@@ -97,16 +143,50 @@ class Engine:
                 n = ser.in_waiting
                 data = ser.read(n if n else 1)
             except Exception as e:  # USB çıkarıldı vb.
-                if not self._stop.is_set():
+                if self._stop.is_set():
+                    break
+                if self.reopen is None:
                     self.events_q.put(("disconnected", str(e)))
                     self._stop.set()
-                break
+                    break
+                put(_LOST)
+                self.events_q.put(("lost", str(e)))
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = self._reconnect()
+                if ser is None:
+                    break
+                self.events_q.put(("reconnected", ""))
+                continue
             if data:
                 t = clock()
                 self.last_rx = t
                 self.total_bytes += len(data)
                 put((t, data))
         put(None)  # işlemciye "bitti" sinyali
+
+    def _reconnect(self):
+        """Port geri gelene kadar saniyede bir dener. Kullanıcı bağlantıyı keserse None döner."""
+        self.reconnecting = True
+        try:
+            while not self._stop.wait(1.0):
+                try:
+                    ser = self.reopen()
+                except Exception:  # noqa: BLE001  port henüz yok
+                    continue
+                if self._stop.is_set():
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                    return None
+                self.ser = ser
+                return ser
+            return None
+        finally:
+            self.reconnecting = False
 
     # ----------------------------------------------------------- işlemci
     def _process_loop(self) -> None:
@@ -149,17 +229,27 @@ class Engine:
                 if it is None:
                     finished = True
                     continue
+                if it is _LOST:
+                    # Bağlantı koptu: yarım satırı at, eldeki kaydı kapat (dosyaya yazılsın)
+                    with self.current.lock:
+                        has_any = self.current.n or self.current._pending
+                        if carry and has_any:
+                            self.current.bad_lines += 1
+                    carry = b""
+                    got_data_since_finish = False
+                    if has_any:
+                        self._finish_current("lost")
+                    continue
                 t, data = it
                 if self._raw:
-                    try:
-                        self._raw.write(data)
-                    except OSError:
-                        pass
+                    self._write_raw(data)
+                if self.hex_on:
+                    self.hex.append(data[-HEX_CHUNK_MAX:])
                 got_data_since_finish = True
                 buf = carry + data.replace(b"\r", b"\n")
                 parts = buf.split(b"\n")
                 carry = parts.pop()
-                if len(carry) > 65536:
+                if len(carry) > MAX_CARRY:
                     parts.append(carry)
                     carry = b""
                 self._handle_lines(t - self.t0, parts, len(data))
@@ -214,7 +304,7 @@ class Engine:
                 self.total_lines += 1
                 if len(self.term) == self.term.maxlen:
                     self.term_dropped += 1
-                term_append(line)
+                term_append(line if len(line) <= TERM_LINE_MAX else line[:TERM_LINE_MAX] + " …")
                 try:
                     p = parse_line(line)
                 except Exception:  # noqa: BLE001
@@ -233,10 +323,11 @@ class Engine:
                     s.add(t, p)
                 except Exception:  # noqa: BLE001  bozuk satır motoru durdurmasın
                     s.bad_lines += 1
-                if p.kind == "end" and self.mode == "dma":
+                if (p.kind == "end" and self.mode == "dma") or (
+                        self.mode == "live" and s.n >= self.segment_rows):
                     s.lock.release()
                     try:
-                        self._finish_current("end")
+                        self._finish_current("end" if p.kind == "end" else "segment")
                     finally:
                         s = self.current
                         s.lock.acquire()
@@ -247,7 +338,10 @@ class Engine:
         old = self.current
         with old.lock:
             old.finish(reason)
-        self.current = self.session_factory()
+        new = self.session_factory()
+        if reason in ("segment", "lost"):
+            new.continue_from(old, keep_seq=reason == "segment")
+        self.current = new
         self.done_q.put(old)
 
 
@@ -359,7 +453,8 @@ def open_port(port: str, baud: int, mode: str):
         return DemoSerial(mode=mode, baud=baud)
     import serial  # geç yükleme: açılışı hızlandırır
 
-    ser = serial.Serial(port, baud, timeout=0.05, write_timeout=1)
+    kw = {} if os.name == "nt" else {"exclusive": True}   # Windows'ta port zaten tek kullanıcılı
+    ser = serial.Serial(port, baud, timeout=0.05, write_timeout=1, **kw)
     try:
         # Windows varsayılanı ~4 KB; 1 MB'a çıkarıyoruz (taşmaya karşı ek güvence)
         ser.set_buffer_size(rx_size=1024 * 1024, tx_size=16384)

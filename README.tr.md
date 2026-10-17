@@ -35,11 +35,19 @@
 - **Excel, CSV ya da TXT.** Excel dosyasında özet sayfası (bütünlük, min/max/ortalama), veriler ve grafik bulunur. Ayrıca gelen her baytın ham yedeği tutulur.
 - **Hızlı canlı grafik:** zoom, kaydırma ve PNG olarak kaydetme. 1 milyon nokta yaklaşık 1 saniyede çizilir.
 - **Kart tanıma:** STM32 (ST-Link), Arduino, ESP32, CH340, CP2102, FTDI ve Raspberry Pi Pico portları ★ ile işaretlenir.
-- **Karta komut gönderme** (örneğin yeni aktarım istemek için `GONDER`).
-- **Türkçe / İngilizce** arayüz, ayarlar hatırlanır.
+- **Karta komut gönderme** (örneğin yeni aktarım istemek için `GONDER`), yazı ya da **HEX bayt** olarak; **↑ / ↓** ile önceki komutlar geri gelir. **HEX görünüm** ham baytları gösterir.
+- **Otomatik yeniden bağlanma:** USB kablosu çıkarsa ya da kart yeniden başlarsa o ana kadarki veri kaydedilir, port geri gelince uygulama kendiliğinden bağlanır.
+- **Kayıt yanlışlıkla kaybolmaz:** Kaydedilmemiş veri varken kapatırken / yeniden bağlanırken / dosya açarken sorar; dosyaları yarım kalmayacak şekilde yazar; çok uzun canlı kayıtları bellek dolmasın diye her 1 milyon satırda böler.
+- **Kısayollar:** F5 bağlan/kes · Ctrl+S farklı kaydet · Ctrl+O dosya aç · Ctrl+L terminali temizle · F1 kılavuz.
+- **Türkçe / İngilizce** arayüz, ayarlar hatırlanır (bir sorun olursa *? → Ayarları sıfırla*).
 - **DEMO portu:** kart olmadan her şeyi deneyebilirsiniz.
+- **Resimli kullanım kılavuzu** (Türkçe / İngilizce): **?** butonu ya da **F1**. Aynı menüde *Güncellemeleri kontrol et*, *Hata bildir / öneri* ve *Hakkında* da var.
+- **İlk açılıştan sonra Windows uyarısı yok:** Uygulama bir kez sorar ve izin verirseniz Windows'un "internetten indirildi" etiketini kaldırır (*Özellikler → Engellemeyi kaldır* ile aynı işlem). Bu sadece parmak izi derlemeyle birebir aynı olan kendi dosyalarına uygulanır.
+- **Dosyaları doğrula:** *? → Hakkında → Dosyaları doğrula*, uygulama klasöründeki her dosyanın SHA-256 parmak izini kontrol eder; değişen, eksik ya da sonradan eklenen (tanınmayan) dosyaları gösterir. Bkz. [Güvenlik](#-güvenlik).
 
 ![Kayıp tespiti](docs/ekran_kayip.png)
+
+![Uygulama içi kılavuz](docs/guide_tr.png)
 
 ---
 
@@ -48,12 +56,16 @@
 ### Windows 10 / 11
 1. **[Data_Logger_Windows.zip](https://github.com/mhmtcndsgn/Data-Logger/releases/latest/download/Data_Logger_Windows.zip)** dosyasını indirin.
 2. **Zip'i açmadan önce** sağ tıklayın → **Özellikler** → alttaki **Engellemeyi kaldır** kutusunu işaretleyin → **Tamam**.
-   *Böylece "Bu dosyayı çalıştırmak istiyor musunuz?" / SmartScreen uyarısı çıkmaz. Uygulama henüz dijital olarak imzalı değil (bkz. [Kod imzalama](#-kod-imzalama-politikası)).*
+   *Böylece "Bu dosyayı çalıştırmak istiyor musunuz?" / SmartScreen uyarısı çıkmaz. Uygulama henüz dijital olarak imzalı değil (bkz. [Kod imzalama](#-kod-imzalama-politikası)). Bu adımı atlarsanız uygulama ilk açılışta etiketi kendisi kaldırmayı teklif eder; uyarı sadece bir kez çıkar.*
 3. Zip'i çıkarın ve **`Data_Logger.exe`**'yi çalıştırın. Exe yanındaki `_internal` klasörüyle birlikte durmalı.
 
-### macOS
+### macOS (Apple Silicon, M1 ve sonrası)
 1. **[Data_Logger_macOS.dmg](https://github.com/mhmtcndsgn/Data-Logger/releases/latest/download/Data_Logger_macOS.dmg)** dosyasını indirin, uygulamayı **Applications** klasörüne sürükleyin.
-2. İlk açılışta uygulamaya sağ tıklayın → **Aç** (ya da **Sistem Ayarları → Gizlilik ve Güvenlik → Yine de Aç**).
+2. İlk açılış: uygulamayı bir kez açmayı deneyin, sonra **Sistem Ayarları → Gizlilik ve Güvenlik** sayfasında **Yine de Aç**'a basın (eski macOS'ta: uygulamaya sağ tık → **Aç**).
+
+### İndirmeyi doğrulama (isteğe bağlı)
+- Dosyanın SHA-256 değerini sürüm sayfasındaki `SHA256SUMS.txt` ile karşılaştırın: PowerShell'de `Get-FileHash Data_Logger_Windows.zip`, macOS'ta `shasum -a 256 Data_Logger_macOS.dmg`.
+- Bu reponun GitHub Actions'ında derlendiğini kontrol edin: `gh attestation verify Data_Logger_Windows.zip -R mhmtcndsgn/Data-Logger`
 
 ---
 
@@ -107,7 +119,19 @@ Windows'ta **`baslat.bat`** dosyasına çift tıklamanız da yeterli; ilk seferd
 Testler: `pip install pytest && python -m pytest tests`
 
 ### Yeni sürüm yayınlamak
-**Actions → Build Data Logger → Run workflow**'a tıklayın, sürüm kutusuna örneğin `v2.0.1` yazıp **Run**'a basın. Windows ve macOS sürümleri otomatik test edilip **Releases**'a eklenir. Yukarıdaki indirme butonları her zaman en son sürümü indirir.
+1. `stm32logger/__init__.py` içindeki `__version__` değerini ayarlayın (örn. `2.1.0`).
+2. **Actions → Build Data Logger → Run workflow**'a tıklayın, sürüm kutusuna aynı sürümü başında `v` ile yazın (örn. `v2.1.0`) ve **Run**'a basın.
+
+Windows ve macOS sürümleri otomatik test edilip `SHA256SUMS.txt` ve derleme kanıtıyla birlikte **Releases**'a eklenir. Yukarıdaki indirme butonları her zaman en son sürümü indirir. İki sürüm numarası farklıysa iş akışı yayınlamayı reddeder.
+
+---
+
+## 🔒 Güvenlik
+
+- Sürümler sadece bu reponun GitHub Actions'ında derlenir: sabitlenmiş action'lar, parmak izi kontrollü bağımlılıklar, sadece okuma yetkili token, SHA-256 özetleri ve imzalı derleme kanıtı.
+- Uygulama yönetici izni istemez; kendiliğinden hiçbir şey indirmez ya da çalıştırmaz.
+- Karttan gelen veriye güvenilmez (uzunluk / kanal sınırı, formül çalıştıramayan CSV/Excel çıktısı).
+- Bir güvenlik açığı bulursanız lütfen gizli bildirin: **[SECURITY.md](SECURITY.md)**.
 
 ---
 
@@ -119,7 +143,7 @@ Windows sürümleri yalnızca bu repodaki herkese açık GitHub Actions iş akı
 - **Onaylayan:** [mhmtcndsgn](https://github.com/mhmtcndsgn)
 
 ### Gizlilik
-Bu program hiçbir bilgiyi ağ üzerinden başka bir sisteme göndermez. Yalnızca seçtiğiniz seri cihazla haberleşir ve seçtiğiniz klasöre dosya yazar.
+Bu program, kullanıcı özellikle istemedikçe hiçbir bilgiyi ağ üzerinden başka bir sisteme göndermez. Yalnızca seçtiğiniz seri cihazla haberleşir ve seçtiğiniz klasöre dosya yazar. Tek ağ isteği, **Güncellemeleri kontrol et**'e bastığınızda GitHub'dan son sürüm numarasının okunmasıdır. **Hata bildir** sadece tarayıcınızda bir GitHub sayfası açar; siz göndermedikçe hiçbir şey gönderilmez.
 
 ---
 
