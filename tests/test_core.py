@@ -474,3 +474,16 @@ def test_lost_junk_does_not_mark_next_session():
     s = eng.done_q.get(timeout=10)
     eng.stop()
     assert s.n == 3 and s.bad_lines == 0 and s.integrity_ok
+
+
+def test_theme_palettes_build():
+    from stm32logger.ui import theme as th
+
+    for mode in ("dark", "light"):
+        for acc in th.ACCENTS:
+            th.apply(mode, acc)
+            qss = th.build_qss("assets")
+            assert "{" in qss and "ACCENT" not in qss and th.ACCENT in qss
+            assert th.SERIES[0] == th.ACCENT_TXT and len(set(th.SERIES)) == len(th.SERIES)
+            assert th.TEXT in th.help_css()
+    th.apply("dark", "blue")

@@ -38,7 +38,9 @@
 - **Karta komut gönderme** (örneğin yeni aktarım istemek için `GONDER`), yazı ya da **HEX bayt** olarak; **↑ / ↓** ile önceki komutlar geri gelir. **HEX görünüm** ham baytları gösterir.
 - **Otomatik yeniden bağlanma:** USB kablosu çıkarsa ya da kart yeniden başlarsa o ana kadarki veri kaydedilir, port geri gelince uygulama kendiliğinden bağlanır.
 - **Kayıt yanlışlıkla kaybolmaz:** Kaydedilmemiş veri varken kapatırken / yeniden bağlanırken / dosya açarken sorar; dosyaları yarım kalmayacak şekilde yazar; çok uzun canlı kayıtları bellek dolmasın diye her 1 milyon satırda böler.
-- **Kısayollar:** F5 bağlan/kes · Ctrl+S farklı kaydet · Ctrl+O dosya aç · Ctrl+L terminali temizle · F1 kılavuz.
+- **Uzun testlere hazır (günler, haftalar):** Canlı izlemede kayıt seçtiğiniz aralıkla (varsayılan 5 dakikada bir) aynı dosyaya yazılır, **Şimdi kaydet** hemen yazar, bağlıyken bilgisayar uykuya geçmez, disk dolmak üzereyse uyarı bandı çıkar.
+- **Kısayollar:** F5 bağlan/kes · Ctrl+S şimdi kaydet · Ctrl+Shift+S farklı kaydet · Ctrl+O dosya aç · Ctrl+L terminali temizle · F1 kılavuz.
+- **Temalar:** Koyu, açık ya da Windows'a uyan; altı renk (mavi, pembe, mor, yeşil, turuncu, turkuaz).
 - **Türkçe / İngilizce** arayüz, ayarlar hatırlanır (bir sorun olursa *? → Ayarları sıfırla*).
 - **DEMO portu:** kart olmadan her şeyi deneyebilirsiniz.
 - **Resimli kullanım kılavuzu** (Türkçe / İngilizce): **?** butonu ya da **F1**. Aynı menüde *Güncellemeleri kontrol et*, *Hata bildir / öneri* ve *Hakkında* da var.

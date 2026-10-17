@@ -103,6 +103,10 @@ class Session:
         self.saved_path: str | None = None   # başarıyla kaydedildiği dosya (arayüz doldurur)
         self.saved_n = 0                     # o kayıtta dosyaya yazılan satır sayısı
         self.exporting = 0                   # sürmekte olan kayıt işi sayısı
+        self.autosave_path: str | None = None  # bu kaydın güncellendiği dosya (hep aynı dosya)
+        self.autosave_fmt = ""
+        self.resave_pending: tuple[str, str] | None = None  # (mod, biçim): yazma sürerken yeni kayıt istendi
+        self.save_failed = False              # son otomatik kayıt başarısız: dakikada bir yeniden denenir
 
     def continue_from(self, old: "Session", keep_seq: bool) -> None:
         """Bölünen (segment) ya da kopup yeniden bağlanan kayıtta kanal adları/sütunlar aynı kalsın.

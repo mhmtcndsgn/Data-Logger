@@ -17,8 +17,8 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QEventLoop, QSettings, QStandardPaths, Qt, QTimer, QUrl
-from PySide6.QtGui import (QAction, QDesktopServices, QFont, QFontDatabase, QIcon, QIntValidator, QKeySequence, QPixmap,
-                           QTextCharFormat, QTextCursor)
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication,
+                           QIcon, QIntValidator, QKeySequence, QPainter, QPixmap, QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
                                QProgressBar, QProgressDialog, QPushButton, QScrollArea, QSplitter, QVBoxLayout,
@@ -40,11 +40,24 @@ TERM_MAX_PER_TICK = 400
 HEX_MAX_PER_TICK = 4096      # HEX görünümde bir seferde en fazla bu kadar bayt gösterilir
 HISTORY_MAX = 30
 DISK_LOW_MB = 500
+AUTOSAVE_MIN = [0, 1, 5, 10, 30]   # canlı izlemede otomatik kaydetme aralığı (dk), 0 = kapalı
 
 
 def _tip(text: str) -> str:
     """Araç ipucu: karttan/USB'den gelen metin HTML olarak yorumlanmasın."""
     return "<p>" + html.escape(str(text)) + "</p>"
+
+
+def _swatch(color: str, size: int = 16) -> QIcon:
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(color))
+    p.drawEllipse(1, 1, size - 2, size - 2)
+    p.end()
+    return QIcon(pm)
 
 
 def _hex_lines(data: bytes) -> list[str]:
@@ -100,6 +113,15 @@ class MainWindow(QMainWindow):
         self._plot_sig = None
         self._port_sig = None
 
+        self._theme_mode = self._sv("theme_mode", "system")
+        if self._theme_mode not in th.MODES:
+            self._theme_mode = "system"
+        self._accent = self._sv("accent", "blue")
+        if self._accent not in th.ACCENTS:
+            self._accent = "blue"
+        th.apply(th.resolve_mode(self._theme_mode), self._accent)
+        QApplication.instance().setStyleSheet(th.build_qss(ASSETS))
+
         self.setWindowTitle(APP_NAME)
         icon = ASSETS / "icon.png"
         if icon.exists():
@@ -123,11 +145,21 @@ class MainWindow(QMainWindow):
         self.plot_timer.start()
         self.port_timer = QTimer(self, interval=2000, timeout=lambda: self._refresh_ports(silent=True))
         self.port_timer.start()
+        self._last_autosave = self._last_disk = self._last_retry = time.monotonic()
+        self._disk_low = False
+        self.long_timer = QTimer(self, interval=15000, timeout=self._periodic)
+        self.long_timer.start()
 
         self._help_dlg = None
         self._bg_q: queue.SimpleQueue = queue.SimpleQueue()
         self.addAction(self.act_guide)   # F1 menü kapalıyken de çalışsın
-        for keys, fn in ((("Ctrl+S",), self._save_as), (("Ctrl+O",), self._open_saved_file),
+        try:   # Windows'ta koyu/açık mod değişince "Sistem" teması da değişsin
+            QGuiApplication.styleHints().colorSchemeChanged.connect(
+                lambda *_: self._theme_mode == "system" and self._apply_theme(save=False))
+        except (AttributeError, TypeError):
+            pass
+        for keys, fn in ((("Ctrl+S",), self._save_now), (("Ctrl+Shift+S",), self._save_as),
+                         (("Ctrl+O",), self._open_saved_file),
                          (("F5",), self._toggle_connect), (("Ctrl+L",), self.term.clear)):
             act = QAction(self, triggered=fn)
             act.setShortcuts([QKeySequence(k) for k in keys])
@@ -204,6 +236,34 @@ class MainWindow(QMainWindow):
         self.help_menu.addSeparator()
         self.help_menu.addAction(self.act_about)
         self.btn_help.setMenu(self.help_menu)
+
+        self.btn_theme = QToolButton()
+        self.btn_theme.setObjectName("HelpBtn")
+        self.btn_theme.setCursor(Qt.PointingHandCursor)
+        self.btn_theme.setPopupMode(QToolButton.InstantPopup)
+        self.theme_menu = QMenu(self.btn_theme)
+        self.sec_mode = self._menu_header(self.theme_menu)
+        self._mode_group = QActionGroup(self)
+        self.act_modes = {}
+        for m in th.MODES:
+            a = QAction(self.theme_menu, checkable=True)
+            a.triggered.connect(lambda _=False, m=m: self._set_theme(mode=m))
+            self._mode_group.addAction(a)
+            self.theme_menu.addAction(a)
+            self.act_modes[m] = a
+        self.theme_menu.addSeparator()
+        self.sec_accent = self._menu_header(self.theme_menu)
+        self._accent_group = QActionGroup(self)
+        self.act_accents = {}
+        for k, (_, _, txt, _) in th.ACCENTS.items():
+            a = QAction(_swatch(txt), "", self.theme_menu, checkable=True)
+            a.triggered.connect(lambda _=False, k=k: self._set_theme(accent=k))
+            self._accent_group.addAction(a)
+            self.theme_menu.addAction(a)
+            self.act_accents[k] = a
+        self.btn_theme.setMenu(self.theme_menu)
+        lay.addWidget(self.btn_theme)
+        lay.addSpacing(4)
         lay.addWidget(self.btn_help)
         lay.addSpacing(6)
         lay.addWidget(self.lbl_lang)
@@ -298,17 +358,27 @@ class MainWindow(QMainWindow):
         self.chk_auto = QCheckBox()
         self.chk_raw = QCheckBox()
         c.add(self.chk_auto)
+        self.lbl_every = c.label()
+        self.every_cb = QComboBox()
+        for m in AUTOSAVE_MIN:
+            self.every_cb.addItem(str(m), m)
+        c.add(self.every_cb)
+        self.chk_auto.toggled.connect(lambda on: (self.every_cb.setEnabled(on), self.lbl_every.setEnabled(on)))
         c.add(self.chk_raw)
         c.lay.addSpacing(4)
+        self.btn_save_quick = QPushButton()
+        self.btn_save_quick.setObjectName("Accent")
+        self.btn_save_quick.clicked.connect(self._save_now)
         self.btn_save_as = QPushButton()
         self.btn_save_as.clicked.connect(self._save_as)
-        self.btn_open_folder = QPushButton()
-        self.btn_open_folder.clicked.connect(self._open_folder)
         row = QHBoxLayout()
         row.setSpacing(6)
+        row.addWidget(self.btn_save_quick, 1)
         row.addWidget(self.btn_save_as, 1)
-        row.addWidget(self.btn_open_folder, 1)
         c.add(row)
+        self.btn_open_folder = QPushButton()
+        self.btn_open_folder.clicked.connect(self._open_folder)
+        c.add(self.btn_open_folder)
         self.btn_open_saved = QPushButton()
         self.btn_open_saved.clicked.connect(self._open_saved_file)
         c.add(self.btn_open_saved)
@@ -403,13 +473,9 @@ class MainWindow(QMainWindow):
         pi.showGrid(x=True, y=True, alpha=0.12)
         pi.setClipToView(True)
         pi.setDownsampling(auto=True, mode="peak")
-        for ax in ("left", "bottom"):
-            a = pi.getAxis(ax)
-            a.setPen(pg.mkPen(th.BORDER))
-            a.setTextPen(pg.mkPen(th.MUTED))
-        self.legend = pi.addLegend(offset=(12, 8), labelTextColor=th.TEXT,
-                                   brush=pg.mkBrush(22, 27, 34, 220), pen=pg.mkPen(th.BORDER))
+        self.legend = pi.addLegend(offset=(12, 8))
         self.legend.setVisible(False)
+        self._style_plot()
         v.addWidget(self.plot, 1)
         return panel
 
@@ -481,6 +547,14 @@ class MainWindow(QMainWindow):
         self.act_report.setText(t("menu_report"))
         self.act_about.setText(t("menu_about"))
         self.act_reset.setText(t("menu_reset"))
+        self.btn_theme.setToolTip(t("theme_btn"))
+        self.sec_mode.setText(t("theme_mode"))
+        self.sec_accent.setText(t("theme_color"))
+        for m, a in self.act_modes.items():
+            a.setText(t("tm_" + m))
+        for k, a in self.act_accents.items():
+            a.setText(t("ac_" + k))
+        self._sync_theme_menu()
         if getattr(self, "_help_dlg", None) is not None:
             self._help_dlg.set_lang(self.lang)
         self.card_conn.title.setText(t("card_conn"))
@@ -514,10 +588,18 @@ class MainWindow(QMainWindow):
         self.btn_browse.setText(t("browse"))
         self.lbl_prefix.setText(t("prefix"))
         self.chk_auto.setText(t("autosave"))
+        self.lbl_every.setText(t("as_every"))
+        self.lbl_every.setToolTip(t("as_tip"))
+        self.every_cb.setToolTip(t("as_tip"))
+        unit = "dk" if self.lang == "tr" else "min"
+        for i, m in enumerate(AUTOSAVE_MIN):
+            self.every_cb.setItemText(i, t("as_off") if m == 0 else f"{m} {unit}")
+        self.btn_save_quick.setText(t("save_quick"))
+        self.btn_save_quick.setToolTip(t("save_quick_tip") + "  (Ctrl+S)")
         self.chk_raw.setText(t("rawbackup"))
         self.chk_raw.setToolTip(t("rawbackup_tip"))
         self.btn_save_as.setText(t("save_now"))
-        self.btn_save_as.setToolTip("Ctrl+S")
+        self.btn_save_as.setToolTip("Ctrl+Shift+S")
         self.btn_open_folder.setText(t("open_folder"))
         self.btn_open_saved.setText(t("open_saved"))
         self.btn_open_saved.setToolTip("Ctrl+O")
@@ -560,6 +642,59 @@ class MainWindow(QMainWindow):
         self._plot_sig = None
         self._update_status_text()
 
+    # ================================================================ TEMA
+    @staticmethod
+    def _menu_header(menu) -> QAction:
+        """Menüde başlık satırı (tıklanamaz, kalın)."""
+        a = QAction(menu)
+        a.setEnabled(False)
+        f = a.font()
+        f.setBold(True)
+        a.setFont(f)
+        menu.addAction(a)
+        return a
+
+    def _style_plot(self) -> None:
+        self.plot.setBackground(th.BG_PLOT)
+        pi = self.plot.getPlotItem()
+        for ax in ("left", "bottom"):
+            a = pi.getAxis(ax)
+            a.setPen(pg.mkPen(th.BORDER))
+            a.setTextPen(pg.mkPen(th.MUTED))
+        self.legend.setBrush(pg.mkBrush(*th.LEGEND_BG))
+        self.legend.setPen(pg.mkPen(th.BORDER))
+        self.legend.setLabelTextColor(th.TEXT)
+
+    def _sync_theme_menu(self) -> None:
+        if self._theme_mode in self.act_modes:
+            self.act_modes[self._theme_mode].setChecked(True)
+        if self._accent in self.act_accents:
+            self.act_accents[self._accent].setChecked(True)
+        self.btn_theme.setIcon(_swatch(th.ACCENT_TXT, 14))
+
+    def _set_theme(self, mode: str | None = None, accent: str | None = None) -> None:
+        if mode is not None:
+            self._theme_mode = mode
+        if accent is not None:
+            self._accent = accent
+        self._apply_theme()
+
+    def _apply_theme(self, save: bool = True) -> None:
+        th.apply(th.resolve_mode(self._theme_mode), self._accent)
+        QApplication.instance().setStyleSheet(th.build_qss(ASSETS))
+        self._style_plot()
+        for i, c in enumerate(self._curves.values()):   # yakınlaştırma korunur, sadece renkler değişir
+            c.setPen(pg.mkPen(th.SERIES[i % len(th.SERIES)], width=1.6))
+        self._plot_sig = None
+        self._set_status_dot(self.engine is not None and not self.engine.reconnecting)
+        self._sync_theme_menu()
+        if getattr(self, "_help_dlg", None) is not None:
+            self._help_dlg.refresh_theme()
+        self._update_stats(force=True)
+        if save:
+            self.settings.setValue("theme_mode", self._theme_mode)
+            self.settings.setValue("accent", self._accent)
+
     def _set_lang(self, lang: str) -> None:
         if lang == self.lang:
             return
@@ -597,6 +732,10 @@ class MainWindow(QMainWindow):
         self.folder_edit.setText(sv("folder", "") or self._default_folder())
         self.prefix_edit.setText(sv("prefix", "") or self.t("default_prefix"))
         self.chk_auto.setChecked(sv("autosave", True, bool))
+        i = self.every_cb.findData(sv("autosave_every", 5, int))
+        self.every_cb.setCurrentIndex(i if i >= 0 else AUTOSAVE_MIN.index(5))
+        self.every_cb.setEnabled(self.chk_auto.isChecked())
+        self.lbl_every.setEnabled(self.chk_auto.isChecked())
         self.chk_raw.setChecked(sv("raw", True, bool))
         self.chk_reconnect.setChecked(sv("reconnect", True, bool))
         self.chk_hex.setChecked(sv("hex", False, bool))
@@ -625,6 +764,8 @@ class MainWindow(QMainWindow):
         self.settings.setValue("help_seen", "true")
         self.settings.setValue("unblock_asked", "true")
         self._history, self._hist_pos = [], 0
+        self._theme_mode, self._accent = "system", "blue"
+        self._apply_theme(save=False)
         self._load_settings()
         self.resize(1360, 860)
         self.splitter.setSizes([480, 260])
@@ -643,6 +784,7 @@ class MainWindow(QMainWindow):
         s.setValue("folder", self.folder_edit.text())
         s.setValue("prefix", self.prefix_edit.text())
         s.setValue("autosave", "true" if self.chk_auto.isChecked() else "false")
+        s.setValue("autosave_every", self.every_cb.currentData())
         s.setValue("raw", "true" if self.chk_raw.isChecked() else "false")
         s.setValue("reconnect", "true" if self.chk_reconnect.isChecked() else "false")
         s.setValue("hex", "true" if self.chk_hex.isChecked() else "false")
@@ -653,6 +795,8 @@ class MainWindow(QMainWindow):
         s.setValue("geometry", self.saveGeometry())
         s.setValue("splitter", self.splitter.saveState())
         s.setValue("lang", self.lang)
+        s.setValue("theme_mode", self._theme_mode)
+        s.setValue("accent", self._accent)
 
     # ================================================================ PORTLAR
     def _refresh_ports(self, initial=False, silent=False, manual=False) -> None:
@@ -771,8 +915,11 @@ class MainWindow(QMainWindow):
         if raw_path:
             self._log(t("msg_raw", path=raw_path), "muted")
         self._check_disk(folder)
+        self._last_autosave = self._last_disk = time.monotonic()
+        if system.keep_awake(True):
+            self._log(t("msg_keep_awake"), "muted")
 
-    def _check_disk(self, folder: str) -> None:
+    def _check_disk(self, folder: str, periodic: bool = False) -> None:
         p = os.path.abspath(folder)
         while p and not os.path.exists(p):
             parent = os.path.dirname(p)
@@ -783,15 +930,18 @@ class MainWindow(QMainWindow):
             free_mb = shutil.disk_usage(p).free // (1024 * 1024)
         except OSError:
             return
-        if free_mb < DISK_LOW_MB:
+        low = free_mb < DISK_LOW_MB
+        if low and not (periodic and self._disk_low):    # test sürerken aynı uyarıyı tekrar tekrar gösterme
             self._log(self.t("disk_low", mb=_fmt_int(free_mb)), "warn")
             self._show_banner(self.t("disk_low", mb=_fmt_int(free_mb)), "bad", show_open=False)
+        self._disk_low = low
 
     def _disconnect(self, lost: str | None = None) -> None:
         eng = self.engine
         if eng is None:
             return
         self.engine = None
+        system.keep_awake(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             eng.stop()
@@ -958,11 +1108,8 @@ class MainWindow(QMainWindow):
         self._banner_base = txt
         self._unsaved.append(s)
         # Bölünen canlı kayıt ve kopan bağlantı: ekrandan gidecek veri kaybolmasın diye her zaman kaydedilir
-        if self.chk_auto.isChecked() or s.finish_reason in ("segment", "lost"):
-            fmt = self.seg_fmt.value()
-            folder = self.folder_edit.text().strip() or self._default_folder()
-            path = self._unique(os.path.join(folder, default_filename(s, self.prefix_edit.text(), fmt)))
-            self._export_async(s, path, fmt)
+        if self.chk_auto.isChecked() or s.finish_reason in ("segment", "lost") or s.autosave_path:
+            self._save_session(s, mode="auto")
             txt += "   ·   " + t("banner_saving")
         self._show_banner(txt, state, show_open=False)
 
@@ -1177,7 +1324,60 @@ class MainWindow(QMainWindow):
             i += 1
         return f"{base}_{i}{ext}"
 
-    def _export_async(self, s: Session, path: str, fmt: str) -> None:
+    def _save_session(self, s: Session, mode: str = "auto", fmt: str | None = None) -> None:
+        """Kaydı her zaman AYNI dosyaya yazar (ilk seferde dosya adı belirlenir).
+
+        mode: "user" (kullanıcı istedi: hata penceresi), "auto" (bitince), "periodic" (aralıklı, sessiz)
+        """
+        fmt = fmt or self.seg_fmt.value()
+        if s.exporting:                    # önceki yazma sürüyor: bitince en güncel haliyle tekrar yaz
+            prio = {"periodic": 0, "auto": 1, "user": 2}
+            old = s.resave_pending
+            if old is None or prio[mode] >= prio[old[0]]:
+                s.resave_pending = (mode, fmt)
+            return
+        folder = self.folder_edit.text().strip() or self._default_folder()
+        path = s.autosave_path if (s.autosave_path and s.autosave_fmt == fmt) else None
+        if path and os.path.normcase(os.path.dirname(os.path.abspath(path))) != \
+                os.path.normcase(os.path.abspath(folder)):
+            path = None                    # kullanıcı kayıt klasörünü değiştirdi: yeni klasöre yaz
+        if path is None:
+            path = self._unique(os.path.join(folder, default_filename(s, self.prefix_edit.text(), fmt)))
+            s.autosave_path, s.autosave_fmt = path, fmt
+        self._export_async(s, path, fmt, mode=mode)
+
+    def _save_now(self) -> None:
+        s = self.view
+        if s is None or s.n == 0:
+            self._msg("info", APP_NAME, self.t("msg_nodata"))
+            return
+        self._save_session(s, mode="user")
+
+    def _periodic(self) -> None:
+        """Uzun testler için: aralıklı otomatik kayıt ve disk kontrolü (15 sn'de bir çalışır)."""
+        now = time.monotonic()
+        if now - self._last_retry >= 60:   # kaydedilemeyenleri (disk dolu, dosya Excel'de açık…) yeniden dene
+            self._last_retry = now
+            for s in list(self._unsaved):
+                if s.save_failed and s.n > s.saved_n and not s.exporting:
+                    self._save_session(s, mode="periodic")
+        eng = self.engine
+        if eng is None:
+            return
+        if now - self._last_disk >= 60:
+            self._last_disk = now
+            self._check_disk(self.folder_edit.text().strip() or self._default_folder(), periodic=True)
+        minutes = self.every_cb.currentData() or 0
+        if not (self.chk_auto.isChecked() and minutes and self._conn_info[2] == "live"):
+            return
+        if now - self._last_autosave < minutes * 60:
+            return
+        self._last_autosave = now
+        cur = eng.current
+        if cur.n > cur.saved_n:
+            self._save_session(cur, mode="periodic")
+
+    def _export_async(self, s: Session, path: str, fmt: str, mode: str = "user") -> None:
         lang = self.lang
         self._reserved.add(os.path.normcase(path))
         s.exporting += 1
@@ -1186,9 +1386,9 @@ class MainWindow(QMainWindow):
             info = {}
             try:
                 export_session(s, path, fmt, lang, info=info)
-                self._export_q.put(("ok", (path, info.get("rows", 0)), s, path))
+                self._export_q.put(("ok", (path, info.get("rows", 0), mode, fmt), s, path))
             except Exception as e:  # noqa: BLE001
-                self._export_q.put(("err", f"{os.path.basename(path)}: {e}", s, path))
+                self._export_q.put(("err", (f"{os.path.basename(path)}: {e}", mode, fmt), s, path))
 
         th_ = threading.Thread(target=job, name="export", daemon=True)
         self._export_threads = [x for x in self._export_threads if x.is_alive()] + [th_]
@@ -1201,24 +1401,47 @@ class MainWindow(QMainWindow):
                 self._reserved.discard(os.path.normcase(path))
                 s.exporting = max(0, s.exporting - 1)
                 if kind == "ok":
-                    val, rows = val
+                    val, rows, mode, fmt = val
                     s.saved_path = val
                     s.saved_n = max(s.saved_n, rows)
+                    s.save_failed = False
                     if s.n <= s.saved_n and s in self._unsaved:
                         self._unsaved.remove(s)
+                    if s.resave_pending:
+                        pmode, pfmt = s.resave_pending
+                        s.resave_pending = None
+                        self._save_session(s, mode=pmode, fmt=pfmt)
                     self.last_saved = val
                     self.saved_btn.setText("💾 " + os.path.basename(val))
                     self.saved_btn.setToolTip(_tip(val))
                     self.saved_btn.show()
-                    self._log(self.t("msg_saved", path=val), "ok")
+                    if mode == "periodic":    # terminali her 5 dk'da bir doldurmasın
+                        self.statusBar().showMessage(self.t("msg_autosaved", name=os.path.basename(val),
+                                                            n=_fmt_int(rows)), 8000)
+                    else:
+                        self._log(self.t("msg_saved", path=val), "ok")
                     if s is self.banner_session and self.banner.isVisible():
                         base = getattr(self, "_banner_base", "")
                         state = self.banner.property("state") or "info"
                         self._show_banner(f"{base}   ·   {self.t('banner_saved', name=os.path.basename(val))}",
                                           state, show_open=True)
                 else:
-                    self._log(self.t("msg_save_err", err=val), "error")
-                    self._msg("error", self.t("err_title"), self.t("msg_save_err", err=val))
+                    err, mode, fmt = val
+                    # Aynı dosyada ısrar etme (Excel'de açık olabilir, disk dolu olabilir): sonraki kayıt yeni ada
+                    s.autosave_path = None
+                    s.save_failed = True
+                    if s not in self._unsaved and s.n > s.saved_n:
+                        self._unsaved.append(s)
+                    if s.resave_pending:
+                        pmode, pfmt = s.resave_pending
+                        s.resave_pending = None
+                        if pmode == "user":
+                            self._save_session(s, mode=pmode, fmt=pfmt)
+                    self._log(self.t("msg_save_err", err=err), "error")
+                    if mode == "user":
+                        self._msg("error", self.t("err_title"), self.t("msg_save_err", err=err))
+                    else:   # otomatik kayıt: test sürerken üst üste pencere açılmasın, bant yeter
+                        self._show_banner(self.t("msg_autosave_err", err=err), "bad", show_open=False)
         except queue.Empty:
             pass
 
@@ -1413,27 +1636,29 @@ class MainWindow(QMainWindow):
             self._disconnect()           # o anki kayıt tamamlansın (listeye girer), sonra hepsi kaydedilir
         self._wait_exports()
         fmt = self.seg_fmt.value()
-        folder = self.folder_edit.text().strip() or self._default_folder()
         for s in self._at_risk():        # diyalog açıkken durum değişmiş olabilir: yeniden hesapla
-            path = self._unique(os.path.join(folder, default_filename(s, self.prefix_edit.text(), fmt)))
-            self._export_async(s, path, fmt)
+            self._save_session(s, mode="user", fmt=fmt)
         self._wait_exports()
         return not self._at_risk()
 
     def _wait_exports(self) -> None:
-        alive = [x for x in self._export_threads if x.is_alive()]
-        if alive:
-            dlg = QProgressDialog(self.t("closing_wait"), None, 0, 0, self)
-            dlg.setWindowTitle(APP_NAME)
-            dlg.setWindowModality(Qt.WindowModal)
-            dlg.setCancelButton(None)
-            dlg.setMinimumDuration(0)
-            dlg.show()
-            while any(x.is_alive() for x in alive):
-                QApplication.processEvents(QEventLoop.ExcludeUserInputEvents, 50)
-                time.sleep(0.02)
+        """Bütün kayıt işleri (ve bitince sıraya giren yeniden kayıtlar) bitene kadar bekler."""
+        dlg = None
+        while True:
+            self._drain_exports()          # biten işleri işle; bekleyen yeniden kayıt varsa yeni iş başlar
+            if not any(x.is_alive() for x in self._export_threads):
+                break
+            if dlg is None:
+                dlg = QProgressDialog(self.t("closing_wait"), None, 0, 0, self)
+                dlg.setWindowTitle(APP_NAME)
+                dlg.setWindowModality(Qt.WindowModal)
+                dlg.setCancelButton(None)
+                dlg.setMinimumDuration(0)
+                dlg.show()
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents, 50)
+            time.sleep(0.02)
+        if dlg is not None:
             dlg.close()
-        self._drain_exports()
 
     # ================================================================ YARDIM / HAKKINDA
     def show_help(self, topic: str | None = None) -> None:
@@ -1449,9 +1674,15 @@ class MainWindow(QMainWindow):
 
     def _first_run(self) -> None:
         s = self.settings
-        if system.should_offer_unblock() and str(s.value("unblock_asked", "false")) != "true":
+        st = system.unblock_status() if str(s.value("unblock_asked", "false")) != "true" else None
+        if st is not None:
             s.setValue("unblock_asked", "true")
-            self._ask_unblock()
+            # Teşhis: neden sorulduğu / sorulmadığı terminalde görünsün
+            self._log(self.t("unblock_diag", exe=self.t("yes") if st["exe"] else self.t("no"), n=st["files"]), "muted")
+            if st["exe"] or st["files"]:
+                self._ask_unblock()
+            else:
+                self._msg("info", self.t("unblock_title"), self.t("unblock_clear"))
         if str(s.value("help_seen", "false")) != "true":
             s.setValue("help_seen", "true")
             self.show_help("quickstart")

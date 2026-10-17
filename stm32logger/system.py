@@ -172,6 +172,46 @@ def should_offer_unblock() -> bool:
     return sys.platform == "win32" and getattr(sys, "frozen", False) and is_blocked(sys.executable)
 
 
+def unblock_status() -> dict | None:
+    """Windows paketinde: {"exe": exe işaretli mi, "files": işaretli dosya sayısı}. Diğerlerinde None."""
+    if not (sys.platform == "win32" and getattr(sys, "frozen", False)):
+        return None
+    return {"exe": is_blocked(sys.executable), "files": len(blocked_files(app_dir()))}
+
+
+# ---------------------------------------------------------------- uyku engeli
+_caffeinate = None
+
+
+def keep_awake(on: bool) -> bool:
+    """Kayıt sürerken bilgisayarın uykuya geçmesini engeller (ekran kapanabilir).
+
+    Windows: SetThreadExecutionState (bağlantı kesilince / uygulama kapanınca kendiliğinden biter).
+    macOS: "caffeinate" (uygulama kapanınca o da kapanır). Kalıcı hiçbir ayar değiştirilmez.
+    Not: Kapak kapatma ve Windows Update'in yeniden başlatması bununla engellenemez.
+    """
+    global _caffeinate
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+            flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0)
+            return bool(ctypes.windll.kernel32.SetThreadExecutionState(flags))
+        if sys.platform == "darwin":
+            import subprocess
+
+            if on and _caffeinate is None:
+                _caffeinate = subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())])
+            elif not on and _caffeinate is not None:
+                _caffeinate.terminate()
+                _caffeinate = None
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 # ---------------------------------------------------------------- güncelleme kontrolü
 def _vtuple(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", v)[:3]) or (0,)

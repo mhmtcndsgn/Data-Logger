@@ -4,13 +4,43 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QGuiApplication, QPixmap
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QImage, QPixmap, QTextDocument
 from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QListWidget, QPushButton, QScrollArea,
                                QTextBrowser, QVBoxLayout)
 
 from .. import APP_NAME, REPO_URL, __version__
-from ..help import HELP_CSS, body_html, topics
+from ..help import body_html, topics
 from ..i18n import T
+from . import theme as th
+
+HELP_IMG_SCALE = 2.0   # kılavuz görselleri 2 kat çözünürlükte üretilir (packaging/make_help_images.py)
+
+
+def crisp(path: str, logical_w: int, dpr: float) -> QImage:
+    """Görseli ekranın gerçek piksel sayısına yumuşak (bulanık değil, pürüzsüz) küçültür.
+
+    Böylece Windows'ta %125-%150 ekran ölçeğinde de görsel pikselleşmez.
+    """
+    src = QImage(path)
+    if src.isNull():
+        return src
+    target = max(1, int(round(logical_w * dpr)))
+    img = src if target >= src.width() else src.scaledToWidth(target, Qt.SmoothTransformation)
+    img.setDevicePixelRatio(img.width() / logical_w)
+    return img
+
+
+class _Browser(QTextBrowser):
+    """Kılavuz görsellerini bellekteki net kopyalardan verir."""
+
+    def __init__(self):
+        super().__init__()
+        self.images: dict[str, QImage] = {}
+
+    def loadResource(self, kind, url):
+        if kind == QTextDocument.ImageResource and url.toString() in self.images:
+            return self.images[url.toString()]
+        return super().loadResource(kind, url)
 
 
 class ImageViewer(QDialog):
@@ -19,7 +49,10 @@ class ImageViewer(QDialog):
     def __init__(self, parent, path: str, title: str):
         super().__init__(parent)
         self.setWindowTitle(title)
-        pm = QPixmap(path)
+        dpr = self.devicePixelRatioF() or 1.0
+        src = QImage(path)
+        logical_w = max(1, int(src.width() / HELP_IMG_SCALE))
+        pm = QPixmap.fromImage(crisp(path, logical_w, dpr))
         lbl = QLabel()
         lbl.setPixmap(pm)
         lbl.setAlignment(Qt.AlignCenter)
@@ -30,8 +63,9 @@ class ImageViewer(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(area)
         scr = QGuiApplication.primaryScreen().availableGeometry() if QGuiApplication.primaryScreen() else None
-        w = min(pm.width() + 30, int(scr.width() * 0.92)) if scr else pm.width() + 30
-        h = min(pm.height() + 30, int(scr.height() * 0.9)) if scr else pm.height() + 30
+        lw, lh = logical_w, int(src.height() / HELP_IMG_SCALE)
+        w = min(lw + 30, int(scr.width() * 0.92)) if scr else lw + 30
+        h = min(lh + 30, int(scr.height() * 0.9)) if scr else lh + 30
         self.resize(max(400, w), max(300, h))
 
 
@@ -50,10 +84,9 @@ class HelpDialog(QDialog):
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list.currentRowChanged.connect(lambda _: self._render())
 
-        self.browser = QTextBrowser()
+        self.browser = _Browser()
         self.browser.setOpenLinks(False)
         self.browser.setSearchPaths([help_dir])
-        self.browser.document().setDefaultStyleSheet(HELP_CSS)
         self.browser.anchorClicked.connect(self._on_link)
 
         self.btn_prev = QPushButton()
@@ -120,16 +153,29 @@ class HelpDialog(QDialog):
     def _img_path(self, name: str) -> str:
         return os.path.join(self.help_dir, self.lang, f"{name}.png")
 
+    def refresh_theme(self) -> None:
+        self._render()
+
     def _render(self) -> None:
         row = self.list.currentRow()
         if row < 0 or not getattr(self, "_keys", None):
             return
-        width = max(320, min(1100, self.browser.viewport().width() - 48))
-        def img_w(name):
-            pm_w = QPixmap(self._img_path(name)).width()
-            return min(width, pm_w) if pm_w > 0 else width
+        maxw = max(320, min(980, self.browser.viewport().width() - 56))
+        dpr = self.devicePixelRatioF() or 1.0
+        self.browser.images.clear()
 
-        html = body_html(self.lang, self._keys[row], img_w, lambda n: os.path.exists(self._img_path(n)))
+        def img(name):
+            path = self._img_path(name)
+            size = QImage(path).size()
+            if size.isEmpty():
+                return ""
+            w = int(min(maxw, size.width() / HELP_IMG_SCALE))     # asla büyütme
+            key = f"mem:{self.lang}/{name}/{w}/{dpr:g}"
+            self.browser.images[key] = crisp(path, w, dpr)
+            return f'<img src="{key}" width="{w}">'
+
+        self.browser.document().setDefaultStyleSheet(th.help_css())
+        html = body_html(self.lang, self._keys[row], img, lambda n: os.path.exists(self._img_path(n)))
         y = self.browser.verticalScrollBar().value() if getattr(self, "_last_row", None) == row else 0
         self.browser.setHtml(html)
         self.browser.verticalScrollBar().setValue(y)

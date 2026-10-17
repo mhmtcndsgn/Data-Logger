@@ -38,7 +38,9 @@
 - **Send commands** to the board (e.g. `SEND` to request a new dump), as text or **HEX bytes**; **↑ / ↓** recalls previous commands. A **HEX view** shows the raw bytes.
 - **Auto-reconnect:** if the USB cable drops or the board restarts, the data received so far is saved and the app reconnects when the port is back.
 - **Never loses a recording by accident:** asks before closing / reconnecting / opening a file when data is unsaved, writes files atomically (no half-written files), and splits very long live recordings every 1 million rows so memory never fills up.
-- **Keyboard shortcuts:** F5 connect/disconnect · Ctrl+S save as · Ctrl+O open · Ctrl+L clear terminal · F1 guide.
+- **Built for long tests (days or weeks):** in live monitor mode the recording is saved to the same file at an interval you choose (default every 5 minutes), **Save now** writes it immediately, the computer is kept awake while connected, and a banner warns when the disk is getting full.
+- **Keyboard shortcuts:** F5 connect/disconnect · Ctrl+S save now · Ctrl+Shift+S save as · Ctrl+O open · Ctrl+L clear terminal · F1 guide.
+- **Themes:** dark, light or follow Windows, in six colors (blue, pink, purple, green, orange, teal).
 - **English / Turkish** interface, settings are remembered (*? → Reset settings* if anything goes wrong).
 - **DEMO port** to try everything without a board.
 - **Built-in illustrated guide** (English / Turkish): click **?** or press **F1**. The same menu has *Check for updates*, *Report a problem / suggestion* and *About*.
@@ -134,9 +136,10 @@ stm32logger/                application package
   help.py                   in-app guide texts (TR / EN)
   system.py                 file integrity, Windows unblock, update check, issue link
   ui/                       PySide6 + pyqtgraph interface
+assets/logo.svg             app logo (icons: python packaging/make_icons.py)
 assets/help/                guide images (regenerate: python packaging/make_help_images.py)
 firmware_ornek/             STM32 and Arduino/ESP32 examples
-packaging/                  exe version info, file fingerprints (manifest), guide images
+packaging/                  exe version info, file fingerprints (manifest), icons, guide images
 tests/                      tests (incl. a 300k-line stress test)
 requirements-lock.txt       pinned, hash-checked dependencies for the build
 SECURITY.md                 security policy and how releases are protected
