@@ -32,7 +32,8 @@ from ..exporter import FORMATS, default_filename, export_session
 from ..i18n import T
 from ..session import Session, clean_note
 from . import theme as th
-from .tools import QuickCmdDialog, UnitsDialog, parse_hex, sanitize_cmds
+from ..analysis import parse_hex, sanitize_cmds
+from .tools import QuickCmdDialog, UnitsDialog
 from .widgets import Card, PanelHeader, Segmented, Tile, guard_wheel, hint_label, hrow
 
 ASSETS = Path(__file__).resolve().parent.parent.parent / "assets"

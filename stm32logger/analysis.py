@@ -163,3 +163,31 @@ def fmt(v: float) -> str:
     if float(v).is_integer():
         return str(int(v))
     return f"{v:.4g}" if a < 1 else f"{v:.6g}"
+
+
+# ------------------------------------------------------------------ hızlı komutlar
+def parse_hex(text: str) -> bytes:
+    """"01 A0 FF", "0x01,0xA0" gibi yazımları bayta çevirir (geçersizse ValueError)."""
+    return bytes.fromhex(text.replace("0x", "").replace("0X", "").replace(",", " "))
+
+
+def _repeat(v) -> float:
+    """Tekrar aralığı: 0 (tekrar yok) ya da 0,1–3600 s (bozuk ayar portu boğmasın)."""
+    r = float(v or 0)
+    if not math.isfinite(r) or r < 0.1:
+        return 0.0
+    return round(min(3600.0, r), 1)
+
+
+def sanitize_cmds(raw) -> list[dict]:
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for c in raw[:12]:
+        try:
+            out.append({"label": str(c.get("label", "?"))[:24], "cmd": str(c.get("cmd", ""))[:500],
+                        "hex": bool(c.get("hex", False)), "eol": str(c.get("eol", "\r\n"))[:2],
+                        "repeat": _repeat(c.get("repeat", 0))})
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return out

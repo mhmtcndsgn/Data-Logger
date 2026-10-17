@@ -577,7 +577,7 @@ def test_notes_with_delimiters_roundtrip_and_no_double_units():
 
 
 def test_quick_cmd_sanitize_and_hex():
-    from stm32logger.ui.tools import parse_hex, sanitize_cmds
+    from stm32logger.analysis import parse_hex, sanitize_cmds   # Qt'siz (CI'da ekran yok)
 
     cmds = sanitize_cmds([{"label": "a", "cmd": "X", "repeat": 1e-6}, {"label": "b", "cmd": "Y", "repeat": "nan"},
                           {"label": "c", "cmd": "Z", "repeat": 99999}, {"label": "d", "cmd": "W", "repeat": 0.5}, 5])

@@ -1,14 +1,13 @@
 """Küçük pencereler: kanal birimleri ve hızlı komut butonları."""
 from __future__ import annotations
 
-import math
-
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QPushButton,
                                QTableWidget, QTableWidgetItem, QVBoxLayout)
 
 from .. import analysis
+from ..analysis import parse_hex
 from ..i18n import T
 
 
@@ -101,11 +100,6 @@ class UnitsDialog(QDialog):
         return analysis.sanitize_units(out)
 
 
-def parse_hex(text: str) -> bytes:
-    """"01 A0 FF", "0x01,0xA0" gibi yazımları bayta çevirir (geçersizse ValueError)."""
-    return bytes.fromhex(text.replace("0x", "").replace("0X", "").replace(",", " "))
-
-
 class QuickCmdDialog(QDialog):
     """Hızlı komut butonu ekle / düzenle."""
 
@@ -169,25 +163,3 @@ class QuickCmdDialog(QDialog):
         return {"label": (self.e_label.text().strip() or cmd.strip() or "?")[:24], "cmd": cmd,
                 "hex": self.c_hex.isChecked(), "eol": self.c_eol.currentData() or "",
                 "repeat": round(self.s_rep.value(), 1)}
-
-
-def _repeat(v) -> float:
-    """Tekrar aralığı: 0 (tekrar yok) ya da 0,1–3600 s (bozuk ayar portu boğmasın)."""
-    r = float(v or 0)
-    if not math.isfinite(r) or r < 0.1:
-        return 0.0
-    return round(min(3600.0, r), 1)
-
-
-def sanitize_cmds(raw) -> list[dict]:
-    out = []
-    if not isinstance(raw, list):
-        return out
-    for c in raw[:12]:
-        try:
-            out.append({"label": str(c.get("label", "?"))[:24], "cmd": str(c.get("cmd", ""))[:500],
-                        "hex": bool(c.get("hex", False)), "eol": str(c.get("eol", "\r\n"))[:2],
-                        "repeat": _repeat(c.get("repeat", 0))})
-        except (TypeError, ValueError, AttributeError):
-            continue
-    return out
