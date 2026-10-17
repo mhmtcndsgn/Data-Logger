@@ -44,6 +44,15 @@ def _as_int(v: float) -> int | None:
     return int(v)
 
 
+_CTRL = {c: " " for c in (*range(0x00, 0x20), 0x7F)}
+
+
+def clean_note(text) -> str:
+    """Not metni tek satır ve kontrol karaktersiz olsun (CSV/TXT satır yapısı bozulmasın,
+    Excel dosyası yazılabilsin), en fazla 500 karakter."""
+    return " ".join(str(text).translate(_CTRL).split())[:500]
+
+
 def _dedupe(names: list[str]) -> list[str]:
     out, seen = [], {}
     for n in names:
@@ -105,8 +114,27 @@ class Session:
         self.exporting = 0                   # sürmekte olan kayıt işi sayısı
         self.autosave_path: str | None = None  # bu kaydın güncellendiği dosya (hep aynı dosya)
         self.autosave_fmt = ""
+        self.autosave_user = False            # autosave_path'i kullanıcı "Farklı kaydet" ile seçti
         self.resave_pending: tuple[str, str] | None = None  # (mod, biçim): yazma sürerken yeni kayıt istendi
         self.save_failed = False              # son otomatik kayıt başarısız: dakikada bir yeniden denenir
+        self.notes: list[tuple[int, float, str]] = []   # (satır, PC zamanı, not) — kayıt sırasında eklenen notlar
+        self.units: dict = {}                 # dışa aktarımda kullanılan birim dönüşümleri (arayüz verir)
+        self.saved_notes = 0                  # dosyaya yazılan not sayısı
+        self.imported = False                 # dosyadan açıldı (değerler zaten dönüştürülmüş olabilir)
+
+    def add_note(self, text: str, t: float, row: int | None = None) -> int:
+        """Not ekler; notun bağlandığı satırı döndürür (verilmezse o anki son satır)."""
+        row = max(0, self.n - 1) if row is None else max(0, min(int(row), max(0, self.n - 1)))
+        self.notes.append((row, t, clean_note(text)))
+        return row
+
+    def unsaved(self) -> bool:
+        """Dosyaya yazılmamış satır ya da not var mı?"""
+        return self.n > self.saved_n or len(self.notes) > self.saved_notes
+
+    def mark_saved(self) -> None:
+        self.saved_n = self.n
+        self.saved_notes = len(self.notes)
 
     def continue_from(self, old: "Session", keep_seq: bool) -> None:
         """Bölünen (segment) ya da kopup yeniden bağlanan kayıtta kanal adları/sütunlar aynı kalsın.

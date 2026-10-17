@@ -20,17 +20,19 @@ from PySide6.QtCore import QEvent, QEventLoop, QSettings, QStandardPaths, Qt, QT
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication,
                            QIcon, QIntValidator, QKeySequence, QPainter, QPixmap, QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
-                               QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-                               QProgressBar, QProgressDialog, QPushButton, QScrollArea, QSplitter, QVBoxLayout,
-                               QWidget)
+                               QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
+                               QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QProgressDialog,
+                               QPushButton, QScrollArea, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
+                               QVBoxLayout, QWidget)
 
 from .. import APP_NAME, ORG_NAME, __version__
-from .. import system
+from .. import analysis, system
 from ..engine import DEMO_PORT, Engine, list_ports, open_port
 from ..exporter import FORMATS, default_filename, export_session
 from ..i18n import T
-from ..session import Session
+from ..session import Session, clean_note
 from . import theme as th
+from .tools import QuickCmdDialog, UnitsDialog, parse_hex, sanitize_cmds
 from .widgets import Card, PanelHeader, Segmented, Tile, guard_wheel, hint_label, hrow
 
 ASSETS = Path(__file__).resolve().parent.parent.parent / "assets"
@@ -112,13 +114,36 @@ class MainWindow(QMainWindow):
         self._curve_owner = None
         self._plot_sig = None
         self._port_sig = None
+        self._last_plot = None          # analiz için son çizilen veri (x, birimli y'ler, adlar)
+        self._cursor_lines: list = []
+        self._note_items: dict = {}
+        self._note_owner = None
+        self._analysis_dur = 0.0
+        self._qc_fail: dict[int, int] = {}
+        self._notes_sig = None
+        self._fft_curves: dict[str, pg.PlotDataItem] = {}
+        self._peaks: dict[str, float] = {}
+        self._analysis_t = 0.0
+        self._fft_fresh = True          # FFT x eksenini bir kez anlamlı aralığa ayarla
+        try:
+            self._units = analysis.sanitize_units(json.loads(self._sv("units", "{}")))
+        except ValueError:
+            self._units = {}
+        try:
+            self._qcmds = sanitize_cmds(json.loads(self._sv("quick_cmds", "")))
+        except ValueError:
+            self._qcmds = []
+        if self._sv("quick_cmds", "") == "":
+            word = "GONDER" if self.lang == "tr" else "SEND"     # DEMO ve örnek kart kodu ikisini de anlar
+            self._qcmds = [{"label": word, "cmd": word, "hex": False, "eol": "\r\n", "repeat": 0.0}]
+        self._qc_timers: dict[int, QTimer] = {}
 
         self._theme_mode = self._sv("theme_mode", "system")
         if self._theme_mode not in th.MODES:
             self._theme_mode = "system"
-        self._accent = self._sv("accent", "blue")
+        self._accent = self._sv("accent", "neutral")
         if self._accent not in th.ACCENTS:
-            self._accent = "blue"
+            self._accent = "neutral"
         th.apply(th.resolve_mode(self._theme_mode), self._accent)
         QApplication.instance().setStyleSheet(th.build_qss(ASSETS))
 
@@ -160,7 +185,8 @@ class MainWindow(QMainWindow):
             pass
         for keys, fn in ((("Ctrl+S",), self._save_now), (("Ctrl+Shift+S",), self._save_as),
                          (("Ctrl+O",), self._open_saved_file),
-                         (("F5",), self._toggle_connect), (("Ctrl+L",), self.term.clear)):
+                         (("F5",), self._toggle_connect), (("Ctrl+L",), self.term.clear),
+                         (("Ctrl+M",), self._add_note)):
             act = QAction(self, triggered=fn)
             act.setShortcuts([QKeySequence(k) for k in keys])
             act.setShortcutContext(Qt.WindowShortcut)
@@ -256,7 +282,7 @@ class MainWindow(QMainWindow):
         self._accent_group = QActionGroup(self)
         self.act_accents = {}
         for k, (_, _, txt, _) in th.ACCENTS.items():
-            a = QAction(_swatch(txt), "", self.theme_menu, checkable=True)
+            a = QAction(_swatch("#8b949e" if k == "neutral" else txt), "", self.theme_menu, checkable=True)
             a.triggered.connect(lambda _=False, k=k: self._set_theme(accent=k))
             self._accent_group.addAction(a)
             self.theme_menu.addAction(a)
@@ -338,6 +364,10 @@ class MainWindow(QMainWindow):
         self.idle_spin.setSuffix(" s")
         self.idle_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
         c.add(self.idle_spin)
+        c.lay.addSpacing(4)
+        self.btn_units = QPushButton()
+        self.btn_units.clicked.connect(self._edit_units)
+        c.add(self.btn_units)
         col.addWidget(c)
 
         # --- Kayıt ---
@@ -475,23 +505,75 @@ class MainWindow(QMainWindow):
         pi.setDownsampling(auto=True, mode="peak")
         self.legend = pi.addLegend(offset=(12, 8))
         self.legend.setVisible(False)
+
+        # Analiz satırı: imleç, FFT, not
+        tools = QHBoxLayout()
+        tools.setSpacing(6)
+        self.btn_cursor = QPushButton()
+        self.btn_cursor.setObjectName("Tool")
+        self.btn_cursor.setCheckable(True)
+        self.btn_cursor.toggled.connect(self._toggle_cursors)
+        self.btn_fft = QPushButton()
+        self.btn_fft.setObjectName("Tool")
+        self.btn_fft.setCheckable(True)
+        self.btn_fft.toggled.connect(self._toggle_fft)
+        self.btn_note = QPushButton()
+        self.btn_note.setObjectName("Tool")
+        self.btn_note.clicked.connect(self._add_note)
+        self.lbl_readout = QLabel()
+        self.lbl_readout.setObjectName("Readout")
+        self.lbl_readout.setTextFormat(Qt.PlainText)
+        self.lbl_readout.setMinimumWidth(10)
+        tools.addWidget(self.btn_cursor)
+        tools.addWidget(self.btn_fft)
+        tools.addWidget(self.btn_note)
+        tools.addSpacing(8)
+        tools.addWidget(self.lbl_readout, 1)
+        v.addLayout(tools)
+
+        self.fft_plot = pg.PlotWidget()
+        fpi = self.fft_plot.getPlotItem()
+        fpi.showGrid(x=True, y=True, alpha=0.12)
+        self.fft_plot.hide()
+        self.plot_split = QSplitter(Qt.Vertical)
+        self.plot_split.setChildrenCollapsible(False)
+        self.plot_split.addWidget(self.plot)
+        self.plot_split.addWidget(self.fft_plot)
+        self.plot_split.setSizes([300, 200])
         self._style_plot()
-        v.addWidget(self.plot, 1)
+        v.addWidget(self.plot_split, 1)
+
+        self._analysis_timer = QTimer(self, singleShot=True, interval=150, timeout=self._update_analysis)
+        self.plot.getPlotItem().getViewBox().sigXRangeChanged.connect(lambda *_: self._analysis_timer.start())
         return panel
 
     def _build_terminal_panel(self) -> QWidget:
-        panel = QFrame()
+        panel = self.bottom_panel = QFrame()
         panel.setObjectName("Panel")
-        v = QVBoxLayout(panel)
-        v.setContentsMargins(12, 10, 12, 12)
-        v.setSpacing(6)
-        h = self.term_hdr = PanelHeader()
-        self.chk_hex = h.add(QCheckBox())
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(8, 8, 8, 8)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        outer.addWidget(self.tabs)
+
+        corner = QWidget()
+        ch = QHBoxLayout(corner)
+        ch.setContentsMargins(0, 0, 4, 4)
+        ch.setSpacing(8)
+        self.chk_hex = QCheckBox()
         self.chk_hex.toggled.connect(self._on_hex_toggled)
-        self.chk_pause = h.add(QCheckBox())
-        self.btn_clear = h.add(QPushButton())
+        self.chk_pause = QCheckBox()
+        self.btn_clear = QPushButton()
         self.btn_clear.clicked.connect(lambda: self.term.clear())
-        v.addWidget(h)
+        for w_ in (self.chk_hex, self.chk_pause, self.btn_clear):
+            ch.addWidget(w_)
+        self.tabs.setCornerWidget(corner, Qt.TopRightCorner)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        term_page = QWidget()
+        v = QVBoxLayout(term_page)
+        v.setContentsMargins(4, 8, 4, 4)
+        v.setSpacing(6)
 
         self.term = QPlainTextEdit()
         self.term.setReadOnly(True)
@@ -517,7 +599,37 @@ class MainWindow(QMainWindow):
         self.btn_send = QPushButton()
         self.btn_send.setObjectName("Accent")
         self.btn_send.clicked.connect(self._send)
+        self.qc_row = QHBoxLayout()
+        self.qc_row.setSpacing(6)
+        v.addLayout(self.qc_row)
         v.addLayout(hrow(self.send_edit, self.chk_hex_send, self.eol_cb, self.btn_send))
+        self.tabs.addTab(term_page, "")
+
+        stats_page = QWidget()
+        sv_ = QVBoxLayout(stats_page)
+        sv_.setContentsMargins(4, 8, 4, 4)
+        self.lbl_stats_scope = QLabel()
+        self.lbl_stats_scope.setObjectName("Hint")
+        self.stats_table = QTableWidget(0, 8)
+        self.stats_table.verticalHeader().setVisible(False)
+        self.stats_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        sv_.addWidget(self.lbl_stats_scope)
+        sv_.addWidget(self.stats_table, 1)
+        self.tabs.addTab(stats_page, "")
+
+        notes_page = QWidget()
+        nv = QVBoxLayout(notes_page)
+        nv.setContentsMargins(4, 8, 4, 4)
+        self.notes_list = QListWidget()
+        self.notes_list.setObjectName("Notes")
+        self.lbl_notes_empty = QLabel()
+        self.lbl_notes_empty.setObjectName("Hint")
+        self.lbl_notes_empty.setWordWrap(True)
+        nv.addWidget(self.lbl_notes_empty)
+        nv.addWidget(self.notes_list, 1)
+        self.tabs.addTab(notes_page, "")
+        self._rebuild_quick()
         return panel
 
     def _build_statusbar(self) -> None:
@@ -621,7 +733,23 @@ class MainWindow(QMainWindow):
         self.btn_png.setText(t("save_png"))
         self.plot.getPlotItem().setLabel("left", t("value"))
 
-        self.term_hdr.title.setText(t("terminal"))
+        self.tabs.setTabText(0, t("tab_terminal"))
+        self.tabs.setTabText(1, t("tab_stats"))
+        self.tabs.setTabText(2, t("tab_notes"))
+        self.stats_table.setHorizontalHeaderLabels([t(k) for k in (
+            "st_ch", "st_last", "st_min", "st_max", "st_mean", "st_rms", "st_std", "st_peak")])
+        self.lbl_notes_empty.setText(t("notes_empty"))
+        self.btn_cursor.setText(t("cursor_btn"))
+        self.btn_cursor.setToolTip(t("cursor_tip"))
+        self.btn_fft.setText(t("fft_btn"))
+        self.btn_fft.setToolTip(t("fft_tip"))
+        self.btn_note.setText(t("note_btn"))
+        self.btn_note.setToolTip(t("note_tip") + "  (Ctrl+M)")
+        self.btn_units.setText(t("units_btn"))
+        self.btn_units.setToolTip(t("units_help"))
+        self.fft_plot.getPlotItem().setLabel("left", t("fft_y"))
+        self._rebuild_quick()
+        self._update_readout()
         self.chk_pause.setText(t("pause"))
         self.chk_hex.setText(t("hex_view"))
         self.chk_hex.setToolTip(t("hex_view_tip"))
@@ -655,12 +783,25 @@ class MainWindow(QMainWindow):
         return a
 
     def _style_plot(self) -> None:
-        self.plot.setBackground(th.BG_PLOT)
-        pi = self.plot.getPlotItem()
-        for ax in ("left", "bottom"):
-            a = pi.getAxis(ax)
-            a.setPen(pg.mkPen(th.BORDER))
-            a.setTextPen(pg.mkPen(th.MUTED))
+        for pw in (self.plot, getattr(self, "fft_plot", None)):
+            if pw is None:
+                continue
+            pw.setBackground(th.BG_PLOT)
+            pi = pw.getPlotItem()
+            for ax in ("left", "bottom"):
+                a = pi.getAxis(ax)
+                a.setPen(pg.mkPen(th.BORDER))
+                a.setTextPen(pg.mkPen(th.MUTED))
+        for k, ln in enumerate(getattr(self, "_cursor_lines", [])):
+            color = th.ACCENT_TXT if k == 0 else "#e3b341"
+            ln.setPen(pg.mkPen(color, width=1.5, style=Qt.DashLine))
+            ln.label.setColor(color)
+            ln.label.fill = pg.mkBrush(th.BG_PANEL)
+        for i, c in enumerate(getattr(self, "_fft_curves", {}).values()):
+            c.setPen(pg.mkPen(th.SERIES[i % len(th.SERIES)], width=1.4))
+        for ln in getattr(self, "_note_items", {}).values():
+            ln.label.fill = pg.mkBrush(th.BG_PANEL)
+            ln.label.update()
         self.legend.setBrush(pg.mkBrush(*th.LEGEND_BG))
         self.legend.setPen(pg.mkPen(th.BORDER))
         self.legend.setLabelTextColor(th.TEXT)
@@ -739,6 +880,8 @@ class MainWindow(QMainWindow):
         self.chk_raw.setChecked(sv("raw", True, bool))
         self.chk_reconnect.setChecked(sv("reconnect", True, bool))
         self.chk_hex.setChecked(sv("hex", False, bool))
+        self.btn_fft.setChecked(sv("fft_on", False, bool))
+        self.tabs.setCurrentIndex(max(0, min(2, sv("bottom_tab", 0, int))))
         self.x_cb.setCurrentIndex(max(0, self.x_cb.findData(sv("xaxis", "auto"))))
         i = self.win_cb.findData(sv("window", 30, int))
         self.win_cb.setCurrentIndex(i if i >= 0 else 1)
@@ -750,6 +893,9 @@ class MainWindow(QMainWindow):
             sp = self.settings.value("splitter")
             if sp is not None:
                 self.splitter.restoreState(sp)
+            ps = self.settings.value("plot_split")
+            if ps is not None:
+                self.plot_split.restoreState(ps)
         except (TypeError, ValueError):
             pass
 
@@ -764,7 +910,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("help_seen", "true")
         self.settings.setValue("unblock_asked", "true")
         self._history, self._hist_pos = [], 0
-        self._theme_mode, self._accent = "system", "blue"
+        self._theme_mode, self._accent = "system", "neutral"
         self._apply_theme(save=False)
         self._load_settings()
         self.resize(1360, 860)
@@ -797,6 +943,11 @@ class MainWindow(QMainWindow):
         s.setValue("lang", self.lang)
         s.setValue("theme_mode", self._theme_mode)
         s.setValue("accent", self._accent)
+        s.setValue("units", json.dumps(self._units, ensure_ascii=False))
+        s.setValue("quick_cmds", json.dumps(self._qcmds, ensure_ascii=False))
+        s.setValue("fft_on", "true" if self.btn_fft.isChecked() else "false")
+        s.setValue("bottom_tab", self.tabs.currentIndex())
+        s.setValue("plot_split", self.plot_split.saveState())
 
     # ================================================================ PORTLAR
     def _refresh_ports(self, initial=False, silent=False, manual=False) -> None:
@@ -942,6 +1093,7 @@ class MainWindow(QMainWindow):
             return
         self.engine = None
         system.keep_awake(False)
+        self._stop_repeats()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             eng.stop()
@@ -969,6 +1121,10 @@ class MainWindow(QMainWindow):
         self.send_edit.setEnabled(not on)
         self.btn_send.setEnabled(not on)
         self.eol_cb.setEnabled(not on)
+        for b in getattr(self, "_qc_buttons", []):
+            b.setEnabled(not on)
+        if on:
+            self._stop_repeats()
 
     # ================================================================ DÖNGÜ
     def _tick(self) -> None:
@@ -1154,7 +1310,7 @@ class MainWindow(QMainWindow):
 
         if eng:
             self.tile_dur.set(_fmt_dur(time.time() - self._conn_t0), " ")
-        elif s and s.mode != "file":
+        elif s and not s.imported:
             self.tile_dur.set(_fmt_dur(s.duration_s()), " ")
         else:
             self.tile_dur.set("—", " ")
@@ -1177,7 +1333,7 @@ class MainWindow(QMainWindow):
             else:
                 self.progress.hide()
         else:
-            if s and s.mode == "file":
+            if s and s.imported:
                 self.tile_status.set(t("status_file"), s.port, th.BLUE_TXT)
             elif s and s.n:
                 self.tile_status.set(t("status_done"), " ", th.GREEN_TXT)
@@ -1228,14 +1384,15 @@ class MainWindow(QMainWindow):
             names = list(s.channels)
             ys = [col[start:n] for col in s.cols]
             th0 = s.t_host[0] if len(s.t_host) else 0.0
-            th_ = s.t_host[start:n] if kind == "host" else None
+            th_ = s.t_host[start:n] if len(s.t_host) >= n else None
+            notes = list(s.notes)
             seq = s.seq[start:n] if (s.has_seq and len(s.seq) >= n) else None
             seq0 = s.seq[0] if seq is not None and len(s.seq) else 0
             fs = s.sample_rate
         self._plot_sig = sig
 
         if kind == "host":
-            x = np.frombuffer(th_, dtype=np.float64) - th0 if len(th_) else np.empty(0)
+            x = np.frombuffer(th_, dtype=np.float64) - th0 if th_ is not None and len(th_) else np.empty(0)
             xlabel = self.t("x_host")
         elif kind == "time":
             base = (np.frombuffer(seq, dtype=np.int64) - seq0) if seq is not None else np.arange(start, n)
@@ -1252,7 +1409,16 @@ class MainWindow(QMainWindow):
             self.legend.clear()
             self._curve_owner = s
             self.plot.enableAutoRange()
+            self._fft_fresh = True
 
+        x_raw = np.asarray(x, dtype=np.float64)
+        # örnekleme hızı (FFT ve imleç frekansı için)
+        # Örnekleme hızı girilmemişse yalnızca canlı izlemede PC zamanından tahmin edilir. Deney
+        # aktarımında PC zamanı USB aktarım hızını gösterir, örnekleme hızını değil → "örnek başına".
+        t_est = None
+        if fs <= 0 and s.mode == "live" and th_ is not None and len(th_) == len(x_raw) and len(x_raw) > 2:
+            t_est = np.frombuffer(th_, dtype=np.float64)
+        fs_eff = fs if fs > 0 else (analysis.estimate_fs(t_est) if t_est is not None else 0.0)
         # Kayıp bölgeleri: çizgiyi kopar ve kırmızı ile işaretle (ara değer uydurma)
         for r in self._gap_items:
             self.plot.removeItem(r)
@@ -1272,26 +1438,419 @@ class MainWindow(QMainWindow):
                 x = x.astype(np.float64)
                 x = np.insert(x, gap_idx, x[gap_idx - 1])   # x sıralı kalır, y'de NaN ile çizgi kopar
 
+        conv_ys, labels = [], []
         for i, name in enumerate(names):
+            u = analysis.unit_of(self._units, name) if not s.imported else None   # açılan dosya zaten dönüştürülmüş
+            lbl = analysis.label(name, u)
+            labels.append(lbl)
             c = self._curves.get(name)
             if c is None:
                 color = th.SERIES[i % len(th.SERIES)]
-                c = self.plot.plot(pen=pg.mkPen(color, width=1.6), name=html.escape(name), connect="finite")
+                c = self.plot.plot(pen=pg.mkPen(color, width=1.6), name=html.escape(lbl), connect="finite")
                 c.setDownsampling(auto=True, method="peak")
                 c.setClipToView(True)
                 self._curves[name] = c
             y = np.frombuffer(ys[i], dtype=np.float64) if len(ys[i]) else np.empty(0)
+            y = analysis.convert(y, u)
+            conv_ys.append(y)
             if gap_idx is not None and len(gap_idx) and len(y) == len(x) - len(gap_idx):
                 y = np.insert(y, gap_idx, np.nan)
             m = min(len(x), len(y))
             c.setData(x[:m], y[:m])
         self.legend.setVisible(bool(self._curves))
+        self._last_plot = {"x": x_raw, "ys": conv_ys, "names": labels, "kind": kind, "fs": fs_eff, "t": t_est,
+                           "unit_x": "s" if kind in ("time", "host") else ""}
+        self._draw_notes(notes, start, n, x_raw, s)
         self._plot_t = time.perf_counter()
         self._plot_dur = self._plot_t - t_start
         self.plot.getPlotItem().setLabel("bottom", xlabel)
+        # canlı kayıtta analiz en fazla saniyede 2 kez (uzun sürüyorsa daha da seyrek)
+        if s.ended_at is not None or \
+                time.perf_counter() - self._analysis_t > max(0.5, 5 * self._analysis_dur):
+            self._update_analysis()
+        self._update_readout()
 
     def _fit_plot(self) -> None:
         self.plot.enableAutoRange()
+        if self.fft_plot.isVisible():
+            self._fft_fresh = True
+            self.fft_plot.enableAutoRange()
+            self._update_analysis()
+
+    # ================================================================ ANALİZ
+    def _visible_slice(self):
+        """Grafikte görünen x aralığına düşen örnekler (yoksa tümü)."""
+        lp = self._last_plot
+        if not lp or not len(lp["x"]):
+            return None, 0, 0
+        x0, x1 = self.plot.getPlotItem().getViewBox().viewRange()[0]
+        x = lp["x"]
+        i0 = int(np.searchsorted(x, x0, side="left"))
+        i1 = int(np.searchsorted(x, x1, side="right"))
+        if i1 - i0 < 2:
+            i0, i1 = 0, len(x)
+        return lp, i0, i1
+
+    def _on_tab_changed(self, idx: int) -> None:
+        self.tabs.cornerWidget(Qt.TopRightCorner).setVisible(idx == 0)
+        if idx == 1:
+            self._update_analysis()
+
+    def _update_analysis(self) -> None:
+        """İstatistik tablosu ve FFT (görünen aralık üzerinden)."""
+        t0 = self._analysis_t = time.perf_counter()
+        try:
+            self._do_analysis()
+        finally:
+            self._analysis_dur = time.perf_counter() - t0
+            # kaydırırken çok sık hesaplamasın: süre uzunsa bekleme de uzar
+            self._analysis_timer.setInterval(int(min(1500, max(150, 2000 * self._analysis_dur))))
+
+    def _do_analysis(self) -> None:
+        want_stats = self.tabs.currentIndex() == 1
+        want_fft = self.btn_fft.isChecked()
+        if not (want_stats or want_fft):
+            return
+        lp, i0, i1 = self._visible_slice()
+        if lp is None:
+            self.stats_table.setRowCount(0)
+            for c in self._fft_curves.values():
+                c.setData([], [])
+            return
+        fs = lp["fs"]
+        if lp["t"] is not None:                # tahmini hız: görünen aralığa göre
+            fs = analysis.estimate_fs(lp["t"][i0:i1]) or fs
+        self._peaks = {}
+        if want_fft:
+            if set(self._fft_curves) != set(lp["names"]):
+                for c in self._fft_curves.values():
+                    self.fft_plot.removeItem(c)
+                self._fft_curves = {}
+                for i, name in enumerate(lp["names"]):
+                    c = self._fft_curves[name] = self.fft_plot.plot(
+                        pen=pg.mkPen(th.SERIES[i % len(th.SERIES)], width=1.4), name=html.escape(name))
+                    c.setDownsampling(auto=True, method="peak")
+                    c.setClipToView(True)
+            fmax = 0.0
+            for name, y in zip(lp["names"], lp["ys"]):
+                res = analysis.spectrum(y[i0:i1], fs)
+                if res is None:
+                    self._fft_curves[name].setData([], [])
+                    continue
+                f, a, peak, _amp = res
+                self._fft_curves[name].setData(f, a)
+                self._peaks[name] = peak
+                fmax = max(fmax, analysis.useful_fmax(f, a))
+            if self._fft_fresh and fmax > 0:     # ilk açılışta ilginç bölgeye yakınlaş (sonra kullanıcıya bırak)
+                self._fft_fresh = False
+                self.fft_plot.enableAutoRange(axis="y")
+                self.fft_plot.setXRange(0, fmax, padding=0.02)
+            self.fft_plot.getPlotItem().setLabel("bottom", self.t("fft_x") if fs > 0 else self.t("fft_x_samples"))
+        if want_stats:
+            names = lp["names"]
+            self.stats_table.setRowCount(len(names))
+            for r, (name, y) in enumerate(zip(names, lp["ys"])):
+                st = analysis.stats(y[i0:i1])
+                peak = self._peaks.get(name)
+                cells = [name] + (["—"] * 6 if st is None else
+                                  [analysis.fmt(st[k]) for k in ("last", "min", "max", "mean", "rms", "std")])
+                cells.append("—" if peak is None else f"{peak:.4g}" + (" Hz" if fs > 0 else ""))
+                for c, txt in enumerate(cells):
+                    it = self.stats_table.item(r, c)
+                    if it is None:
+                        it = QTableWidgetItem()
+                        self.stats_table.setItem(r, c, it)
+                    it.setText(txt)
+            self.lbl_stats_scope.setText(self.t("stats_scope", n=_fmt_int(i1 - i0))
+                                         + ("" if want_fft else "  ·  " + self.t("stats_fft_hint")))
+
+    def _toggle_fft(self, on: bool) -> None:
+        self.fft_plot.setVisible(on)
+        if on:
+            self._fft_fresh = True
+            self.fft_plot.enableAutoRange()
+            self._update_analysis()
+
+    def _toggle_cursors(self, on: bool) -> None:
+        for ln in self._cursor_lines:
+            self.plot.removeItem(ln)
+        self._cursor_lines = []
+        if on:
+            x0, x1 = self.plot.getPlotItem().getViewBox().viewRange()[0]
+            for k, (frac, name) in enumerate(((1 / 3, "A"), (2 / 3, "B"))):
+                color = th.ACCENT_TXT if k == 0 else "#e3b341"
+                ln = pg.InfiniteLine(pos=x0 + (x1 - x0) * frac, angle=90, movable=True,
+                                     pen=pg.mkPen(color, width=1.5, style=Qt.DashLine),
+                                     hoverPen=pg.mkPen(color, width=3), label=name,
+                                     labelOpts={"position": 0.96, "color": color, "fill": th.BG_PANEL})
+                ln.sigPositionChanged.connect(lambda *_: self._update_readout())
+                self.plot.addItem(ln)
+                self._cursor_lines.append(ln)
+        self._update_readout()
+
+    def _update_readout(self) -> None:
+        """İmleç değerleri: A, B, aralarındaki fark ve frekans."""
+        if not self._cursor_lines:
+            self.lbl_readout.setText(self.t("cursor_hint") if self.btn_cursor.isChecked() else "")
+            self.lbl_readout.setToolTip("")
+            return
+        lp = self._last_plot
+        a, b = (ln.value() for ln in self._cursor_lines)
+        ux = lp["unit_x"] if lp else ""
+        dx = b - a
+        parts = [f"A = {analysis.fmt(a)} {ux}".strip(), f"B = {analysis.fmt(b)} {ux}".strip(),
+                 f"Δ = {analysis.fmt(dx)} {ux}".strip()]
+        if lp and dx:
+            if ux == "s":
+                parts.append(f"1/Δ = {analysis.fmt(1 / abs(dx))} Hz")
+            elif lp["fs"] > 0:
+                parts.append(f"Δt = {analysis.fmt(abs(dx) / lp['fs'])} s")
+        lines = []
+        if lp and len(lp["x"]):
+            ia, ib = analysis.nearest(lp["x"], a), analysis.nearest(lp["x"], b)
+            for name, y in zip(lp["names"], lp["ys"]):
+                if ia < len(y) and ib < len(y):
+                    ya, yb = float(y[ia]), float(y[ib])
+                    lines.append(f"{name}: {analysis.fmt(ya)} → {analysis.fmt(yb)} (Δ {analysis.fmt(yb - ya)})")
+        text = "   ".join(parts)
+        if lines:
+            text += "   |   " + "   ".join(lines[:2]) + ("   …" if len(lines) > 2 else "")
+        self.lbl_readout.setText(text)
+        self.lbl_readout.setToolTip(_tip("\n".join(["   ".join(parts)] + lines)))
+
+    # ================================================================ NOTLAR
+    def _note_target(self) -> Session | None:
+        eng = self.engine
+        if eng is not None and eng.current.n > 0:
+            return eng.current
+        return self.view if (self.view is not None and self.view.n > 0) else None
+
+    def _add_note(self) -> None:
+        s = self._note_target()
+        if s is None:
+            self._msg("info", APP_NAME, self.t("msg_nodata"))
+            return
+        # Not, kısayola basıldığı ANA bağlanır (yazarken gelen satırlara değil)
+        eng = self.engine
+        with s.lock:
+            row = max(0, s.n - 1)
+            if eng is not None and s is eng.current:
+                t_now = time.perf_counter() - eng.t0
+            else:
+                t_now = s.t_host[row] if len(s.t_host) > row else 0.0
+        text, ok = QInputDialog.getText(self, self.t("note_title"), self.t("note_ask"))
+        text = clean_note(text)
+        if not ok or not text:
+            return
+        with s.lock:
+            row = s.add_note(text, t_now, row=row)
+        self._log(self.t("msg_note", row=_fmt_int(row + 1), text=text), "info")
+        self._plot_sig = None
+        self._notes_sig = None
+        self._refresh_notes()
+        if s.ended_at is not None:
+            if s not in self._unsaved:
+                self._unsaved.append(s)             # kaydedilemezse kapatırken sorulsun
+            if s.saved_path or s.exporting or s.autosave_path:
+                self._save_session(s, mode="auto")  # kaydedilmiş dosyaya da yansısın (yazma sürüyorsa sıraya girer)
+
+    def _draw_notes(self, notes, start: int, n: int, x_raw, s: Session) -> None:
+        """Not çizgileri: her karede yeniden oluşturmak yerine sadece yerleri güncellenir."""
+        if self._note_owner is not s:
+            self._clear_note_items()
+            self._note_owner = s
+        want = {}
+        for idx in range(max(0, len(notes) - 200), len(notes)):
+            r = min(notes[idx][0], n - 1)
+            if start <= r and r - start < len(x_raw):
+                want[(idx, notes[idx][0], notes[idx][2])] = float(x_raw[r - start])
+        for idx in [k for k in self._note_items if k not in want]:
+            self.plot.removeItem(self._note_items.pop(idx))
+        for idx, pos in want.items():
+            ln = self._note_items.get(idx)
+            if ln is None:
+                ln = pg.InfiniteLine(pos=pos, angle=90, movable=False,
+                                     pen=pg.mkPen("#e3b341", width=1.2, style=Qt.DotLine),
+                                     label="📝 " + idx[2][:40],
+                                     labelOpts={"position": 0.88, "color": "#e3b341", "fill": th.BG_PANEL})
+                ln.setZValue(5)
+                self.plot.addItem(ln)
+                self._note_items[idx] = ln
+            elif ln.value() != pos:
+                ln.setValue(pos)
+        self._refresh_notes()
+
+    def _clear_note_items(self) -> None:
+        for it in self._note_items.values():
+            self.plot.removeItem(it)
+        self._note_items = {}
+
+    def _refresh_notes(self) -> None:
+        s = self.view
+        sig = (id(s), len(s.notes)) if s is not None else None
+        if sig == self._notes_sig:
+            return
+        self._notes_sig = sig
+        self.notes_list.clear()
+        notes = list(s.notes) if s is not None else []
+        for row, t_, text in notes:
+            self.notes_list.addItem(f"#{row + 1}  ·  {analysis.fmt(round(t_, 2))} s  ·  {text}")
+        self.lbl_notes_empty.setVisible(not notes)
+
+    # ================================================================ BİRİMLER
+    def _edit_units(self) -> None:
+        chans = list(self.view.channels) if self.view is not None and not self.view.imported else []
+        if self.engine is not None:
+            chans = list(dict.fromkeys(chans + list(self.engine.current.channels)))
+        dlg = UnitsDialog(self, self.lang, chans, self._units)
+        if dlg.exec():
+            self._units = dlg.result_units()
+            self.settings.setValue("units", json.dumps(self._units, ensure_ascii=False))
+            self._curve_owner = None          # gösterge adları birimle yeniden yazılsın
+            self._plot_sig = None
+            self._fft_curves_reset()
+
+    def _fft_curves_reset(self) -> None:
+        for c in self._fft_curves.values():
+            self.fft_plot.removeItem(c)
+        self._fft_curves = {}
+
+    # ================================================================ HIZLI KOMUTLAR
+    def _rebuild_quick(self) -> None:
+        if not hasattr(self, "qc_row"):
+            return
+        self._stop_repeats()
+        while self.qc_row.count():
+            w = self.qc_row.takeAt(0).widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        self._qc_buttons = []
+        for i, c in enumerate(self._qcmds):
+            b = QPushButton(c["label"])
+            b.setObjectName("Quick")
+            b.setCheckable(c["repeat"] > 0)
+            b.setToolTip(self.t("qc_tip_rep", s=analysis.fmt(c["repeat"]), cmd=c["cmd"]) if c["repeat"] > 0
+                         else self.t("qc_tip_once", cmd=c["cmd"]))
+            b.clicked.connect(lambda checked=False, i=i: self._quick_clicked(i, checked))
+            b.setContextMenuPolicy(Qt.CustomContextMenu)
+            b.customContextMenuRequested.connect(lambda pos, i=i, b=b: self._quick_menu(i, b, pos))
+            b.setEnabled(self.engine is not None)
+            self.qc_row.addWidget(b)
+            self._qc_buttons.append(b)
+        add = self._qc_add = QPushButton(self.t("qc_add"))
+        add.setObjectName("Quick")
+        add.setToolTip(self.t("qc_add_tip"))
+        add.clicked.connect(lambda: self._quick_edit(None))
+        add.setEnabled(len(self._qcmds) < 12)
+        self.qc_row.addWidget(add)
+        self.qc_row.addStretch(1)
+
+    def _quick_bytes(self, c: dict) -> tuple[bytes, str] | None:
+        if c["hex"]:
+            try:
+                data = parse_hex(c["cmd"])
+            except ValueError as e:
+                self._log(self.t("msg_hex_err", err=e), "error")
+                return None
+            return data, data.hex(" ").upper() or "∅"
+        return (c["cmd"] + c["eol"]).encode("utf-8"), c["cmd"] or "⏎"
+
+    def _quick_clicked(self, i: int, checked: bool) -> None:
+        if i >= len(self._qcmds) or self.engine is None:
+            return
+        c = self._qcmds[i]
+        if c["repeat"] > 0:
+            if checked:
+                tm = QTimer(self, interval=int(c["repeat"] * 1000))
+                tm.timeout.connect(lambda i=i: self._quick_send(i, quiet=True))
+                tm.start()
+                self._qc_timers[i] = tm
+                self._log(self.t("qc_repeat_on", label=c["label"], s=analysis.fmt(c["repeat"])), "info")
+                self._quick_send(i)
+            else:
+                self._stop_repeat(i)
+                self._log(self.t("qc_repeat_off", label=c["label"]), "muted")
+        else:
+            self._quick_send(i)
+
+    def _quick_send(self, i: int, quiet: bool = False) -> None:
+        eng = self.engine
+        if eng is None or i >= len(self._qcmds):
+            return
+        if eng.reconnecting:                 # port geri gelene kadar tekrarlar sessizce atlanır
+            if not quiet:
+                self._log(self.t("msg_send_err", err=self.t("status_reconnecting")), "error")
+            return
+        res = self._quick_bytes(self._qcmds[i])
+        if res is None:
+            self._stop_repeat(i, uncheck=True)
+            return
+        data, shown = res
+        try:
+            eng.send(data)
+            if not quiet:
+                self._log(self.t("msg_sent", cmd=shown), "info")
+            self._qc_fail.pop(i, None)
+        except Exception as e:  # noqa: BLE001
+            fails = self._qc_fail[i] = self._qc_fail.get(i, 0) + 1
+            if fails == 1 or i not in self._qc_timers:
+                self._log(self.t("msg_send_err", err=e), "error")
+            # kablo çekilince ilk deneme hata verebilir (yeniden bağlanma birazdan başlar): 3 kez üst üste
+            # hata olursa tekrarı durdur, terminal hatayla dolmasın
+            if i in self._qc_timers and fails >= 3:
+                self._stop_repeat(i, uncheck=True)
+                self._log(self.t("qc_repeat_off", label=self._qcmds[i]["label"]), "muted")
+
+    def _stop_repeat(self, i: int, uncheck: bool = False) -> None:
+        self._qc_fail.pop(i, None)
+        tm = self._qc_timers.pop(i, None)
+        if tm is not None:
+            tm.stop()
+            tm.deleteLater()
+        if uncheck and i < len(self._qc_buttons) and self._qc_buttons[i].isCheckable():
+            b = self._qc_buttons[i]
+            b.blockSignals(True)
+            b.setChecked(False)
+            b.blockSignals(False)
+
+    def _stop_repeats(self) -> None:
+        self._qc_fail = {}
+        for tm in self._qc_timers.values():
+            tm.stop()
+            tm.deleteLater()
+        self._qc_timers = {}
+        for b in getattr(self, "_qc_buttons", []):
+            if b.isCheckable():
+                b.blockSignals(True)
+                b.setChecked(False)
+                b.blockSignals(False)
+
+    def _quick_menu(self, i: int, btn, pos) -> None:
+        m = QMenu(self)
+        a_edit = m.addAction(self.t("qc_edit"))
+        a_del = m.addAction(self.t("qc_delete"))
+        act = m.exec(btn.mapToGlobal(pos))
+        if act is a_edit:
+            self._quick_edit(i)
+        elif act is a_del and i < len(self._qcmds):
+            del self._qcmds[i]
+            self.settings.setValue("quick_cmds", json.dumps(self._qcmds, ensure_ascii=False))
+            self._rebuild_quick()
+
+    def _quick_edit(self, i: int | None) -> None:
+        dlg = QuickCmdDialog(self, self.lang, self._qcmds[i] if i is not None else None)
+        if not dlg.exec():
+            return
+        c = dlg.result_cmd()
+        if i is None:
+            self._qcmds.append(c)
+        else:
+            self._qcmds[i] = c
+        self._qcmds = sanitize_cmds(self._qcmds)
+        self.settings.setValue("quick_cmds", json.dumps(self._qcmds, ensure_ascii=False))
+        self._rebuild_quick()
 
     def _save_png(self) -> None:
         from pyqtgraph.exporters import ImageExporter
@@ -1337,8 +1896,10 @@ class MainWindow(QMainWindow):
                 s.resave_pending = (mode, fmt)
             return
         folder = self.folder_edit.text().strip() or self._default_folder()
+        if s.autosave_user and s.autosave_path:   # kullanıcının "Farklı kaydet" ile seçtiği dosya
+            fmt = s.autosave_fmt
         path = s.autosave_path if (s.autosave_path and s.autosave_fmt == fmt) else None
-        if path and os.path.normcase(os.path.dirname(os.path.abspath(path))) != \
+        if path and not s.autosave_user and os.path.normcase(os.path.dirname(os.path.abspath(path))) != \
                 os.path.normcase(os.path.abspath(folder)):
             path = None                    # kullanıcı kayıt klasörünü değiştirdi: yeni klasöre yaz
         if path is None:
@@ -1359,7 +1920,7 @@ class MainWindow(QMainWindow):
         if now - self._last_retry >= 60:   # kaydedilemeyenleri (disk dolu, dosya Excel'de açık…) yeniden dene
             self._last_retry = now
             for s in list(self._unsaved):
-                if s.save_failed and s.n > s.saved_n and not s.exporting:
+                if s.save_failed and s.unsaved() and not s.exporting:
                     self._save_session(s, mode="periodic")
         eng = self.engine
         if eng is None:
@@ -1374,19 +1935,22 @@ class MainWindow(QMainWindow):
             return
         self._last_autosave = now
         cur = eng.current
-        if cur.n > cur.saved_n:
+        if cur.unsaved():
             self._save_session(cur, mode="periodic")
 
     def _export_async(self, s: Session, path: str, fmt: str, mode: str = "user") -> None:
         lang = self.lang
+        # Bu işe özel kopya (aynı anda başka bir kayıt farklı birimle yazıyor olabilir).
+        # Açılan dosyanın değerleri zaten dönüştürülmüş olabilir: tekrar dönüştürülmez.
+        units = {} if s.imported else {k: dict(v) for k, v in self._units.items()}
         self._reserved.add(os.path.normcase(path))
         s.exporting += 1
 
         def job():
             info = {}
             try:
-                export_session(s, path, fmt, lang, info=info)
-                self._export_q.put(("ok", (path, info.get("rows", 0), mode, fmt), s, path))
+                export_session(s, path, fmt, lang, info=info, units=units)
+                self._export_q.put(("ok", (path, info.get("rows", 0), info.get("notes", 0), mode, fmt), s, path))
             except Exception as e:  # noqa: BLE001
                 self._export_q.put(("err", (f"{os.path.basename(path)}: {e}", mode, fmt), s, path))
 
@@ -1401,11 +1965,12 @@ class MainWindow(QMainWindow):
                 self._reserved.discard(os.path.normcase(path))
                 s.exporting = max(0, s.exporting - 1)
                 if kind == "ok":
-                    val, rows, mode, fmt = val
+                    val, rows, n_notes, mode, fmt = val
                     s.saved_path = val
                     s.saved_n = max(s.saved_n, rows)
+                    s.saved_notes = max(s.saved_notes, n_notes)
                     s.save_failed = False
-                    if s.n <= s.saved_n and s in self._unsaved:
+                    if not s.unsaved() and s in self._unsaved:
                         self._unsaved.remove(s)
                     if s.resave_pending:
                         pmode, pfmt = s.resave_pending
@@ -1429,8 +1994,9 @@ class MainWindow(QMainWindow):
                     err, mode, fmt = val
                     # Aynı dosyada ısrar etme (Excel'de açık olabilir, disk dolu olabilir): sonraki kayıt yeni ada
                     s.autosave_path = None
+                    s.autosave_user = False
                     s.save_failed = True
-                    if s not in self._unsaved and s.n > s.saved_n:
+                    if s not in self._unsaved and s.unsaved():
                         self._unsaved.append(s)
                     if s.resave_pending:
                         pmode, pfmt = s.resave_pending
@@ -1469,6 +2035,8 @@ class MainWindow(QMainWindow):
             path += FORMATS[ext]
         if os.path.normcase(path) in self._reserved:    # aynı dosya şu an otomatik kaydediliyor
             path = self._unique(path)
+        if s.ended_at is not None:       # bitmiş kayıt: sonradan eklenen notlar da BU dosyaya yazılsın
+            s.autosave_path, s.autosave_fmt, s.autosave_user = path, ext, True
         self._export_async(s, path, ext)
 
     def _browse_folder(self) -> None:
@@ -1599,7 +2167,7 @@ class MainWindow(QMainWindow):
     def _at_risk(self) -> list[Session]:
         """Kaydedilmeden kaybolacak oturumlar.
 
-        Bir oturum, dosyaya yazılan satır sayısından (saved_n) fazla satırı varsa risktedir.
+        Bir oturumda dosyaya yazılmamış satır ya da not varsa (Session.unsaved) risktedir.
         Bağlıyken ve otomatik kaydetme açıkken o anki kayıt, bağlantı kesilince zaten kaydedilir.
         """
         eng = self.engine
@@ -1609,12 +2177,12 @@ class MainWindow(QMainWindow):
         cands.append(self.view)
         out, seen = [], set()
         for s in cands:
-            if (s is None or id(s) in seen or s.mode == "file" or s.exporting or s.n <= s.saved_n
+            if (s is None or id(s) in seen or s.exporting or not s.unsaved()
                     or (eng is not None and s is eng.current and self.chk_auto.isChecked())):
                 continue
             seen.add(id(s))
             out.append(s)
-        self._unsaved = [s for s in self._unsaved if s.n > s.saved_n or s.exporting]
+        self._unsaved = [s for s in self._unsaved if s.unsaved() or s.exporting]
         return out
 
     def _confirm_discard(self) -> bool:
@@ -1630,7 +2198,7 @@ class MainWindow(QMainWindow):
         if ans is not True:
             self._unsaved.clear()
             for s in risk:
-                s.saved_n = s.n          # kullanıcı vazgeçti: tekrar sorulmasın
+                s.mark_saved()           # kullanıcı vazgeçti: tekrar sorulmasın
             return True
         if self.engine is not None and not self.chk_auto.isChecked():
             self._disconnect()           # o anki kayıt tamamlansın (listeye girer), sonra hepsi kaydedilir

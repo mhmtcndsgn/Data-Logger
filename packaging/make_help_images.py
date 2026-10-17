@@ -139,7 +139,7 @@ def make(lang: str, app) -> None:
     st = QSettings(ORG_NAME, "DataLogger")
     st.clear()
     st.setValue("theme_mode", "dark")
-    st.setValue("accent", "blue")
+    st.setValue("accent", "neutral")
     w = MainWindow()
     w._ask = lambda *a: "alt"          # kapanışta "kaydedilmemiş veri" sorusu çıkmasın
     w.lang_cb.setCurrentIndex(0 if lang == "tr" else 1)
@@ -191,13 +191,45 @@ def make(lang: str, app) -> None:
     # --- chart: grafik + terminal
     w.term.appendPlainText("SEND" if lang == "en" else "GONDER")
     pix = grab(w)
-    plot_panel = w.plot.parentWidget()
-    term_panel = w.term.parentWidget()
+    plot_panel = w.plot_split.parentWidget()
+    term_panel = w.bottom_panel
     crop = union(wrect(w, plot_panel), wrect(w, term_panel)).adjusted(-8, -8, 8, 8)
+    qbtns = list(w._qc_buttons) + [w._qc_add]
     marks = [wrect(w, w.x_cb), wrect(w, w.win_cb), wrect(w, w.btn_fit), wrect(w, w.btn_png),
              scene_rect(w, w.plot, w.legend), union(wrect(w, w.chk_hex), wrect(w, w.btn_clear)),
-             union(wrect(w, w.send_edit), wrect(w, w.btn_send))]
+             union(*[wrect(w, b) for b in qbtns]), union(wrect(w, w.send_edit), wrect(w, w.btn_send))]
     annotate(pix, numbered(marks), crop, os.path.join(d, "chart.png"))
+
+    # --- analysis: imleç + FFT + not + istatistik
+    s = w.view
+    s.add_note("motor" if lang == "en" else "motor açıldı", s.t_host[1500])
+    s.notes[-1] = (1500, s.notes[-1][1], s.notes[-1][2])
+    w._plot_sig = None
+    w._notes_sig = None
+    w.resize(1360, 1000)
+    w.btn_fft.setChecked(True)
+    w.tabs.setCurrentIndex(1)
+    pump(app, 0.3)
+    w._update_plot()
+    pump(app, 0.4)
+    w.btn_cursor.setChecked(True)
+    w._cursor_lines[0].setValue(0.62)
+    w._cursor_lines[1].setValue(0.62 + 1 / 2.5)
+    w._update_analysis()
+    pump(app, 0.6)
+    pix = grab(w)
+    crop = union(wrect(w, plot_panel), wrect(w, term_panel)).adjusted(-8, -8, 8, 8)
+    marks = [wrect(w, w.btn_cursor), wrect(w, w.lbl_readout),
+             wrect(w, w.btn_fft), wrect(w, w.fft_plot), wrect(w, w.btn_note),
+             scene_rect(w, w.plot, next(iter(w._note_items.values())).label), wrect(w, w.stats_table)]
+    annotate(pix, numbered(marks), crop, os.path.join(d, "analysis.png"))
+    w.btn_cursor.setChecked(False)
+    w.btn_fft.setChecked(False)
+    w.tabs.setCurrentIndex(0)
+    s.notes.clear()
+    w._plot_sig = None
+    w.resize(1360, 860)
+    pump(app, 0.3)
 
     # --- connect + saving: yan panel tamamı görünsün diye pencereyi uzat
     w.resize(1360, 1400)
@@ -206,7 +238,7 @@ def make(lang: str, app) -> None:
     crop = union(wrect(w, w.card_conn), wrect(w, w.card_data)).adjusted(-10, -10, 10, 10)
     marks = [wrect(w, w.port_cb), wrect(w, w.btn_refresh), wrect(w, w.baud_cb), wrect(w, w.seg_mode),
              wrect(w, w.chk_reconnect), wrect(w, w.btn_connect), wrect(w, w.fs_spin), wrect(w, w.seq_cb),
-             wrect(w, w.idle_spin)]
+             wrect(w, w.idle_spin), wrect(w, w.btn_units)]
     annotate(pix, numbered(marks), crop, os.path.join(d, "connect.png"))
 
     pix = grab(w)
@@ -230,7 +262,7 @@ def make(lang: str, app) -> None:
     save_plain(w, os.path.join(DOCS, "screenshot_gap.png" if lang == "en" else "ekran_kayip.png"))
 
     # --- README: kılavuz penceresi
-    w.show_help("saving")
+    w.show_help("analysis")
     dlg = w._help_dlg
     dlg.resize(1100, 760)
     pump(app, 0.8)

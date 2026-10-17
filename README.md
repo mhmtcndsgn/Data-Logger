@@ -34,13 +34,20 @@
   - **Experiment dump:** the board records into memory and sends everything at the end; the app detects the end of the transfer, saves it automatically and waits for the next one.
 - **Excel, CSV or TXT.** Excel files include a summary sheet (integrity, min/max/mean), the data and a chart. A raw backup of every received byte is kept as well.
 - **Fast live chart** with zoom/pan and PNG export; 1 million points render in about a second.
+- **Analysis tools**
+  - **📏 Measurement cursors:** two vertical lines (A/B) showing the time between them (Δ), the frequency (1/Δ) and each channel's change in value.
+  - **📊 FFT:** frequency spectrum of the visible range and each channel's peak frequency.
+  - **Live statistics** for the visible range: last / min / max / mean / RMS / std. dev. / peak frequency.
+  - **Unit conversion:** per-channel scale, offset and unit (e.g. ADC counts → volts, with a one-click ADC helper). The chart, statistics and Excel/CSV export use the converted values.
+- **📝 Notes:** press **Ctrl+M** while recording to mark the moment (e.g. "motor on"). Notes appear on the chart, in a *Note* column in Excel/CSV and in the **Notes** tab.
 - **Board detection:** STM32 (ST-Link), Arduino, ESP32, CH340, CP2102, FTDI and Raspberry Pi Pico ports are marked with ★.
 - **Send commands** to the board (e.g. `SEND` to request a new dump), as text or **HEX bytes**; **↑ / ↓** recalls previous commands. A **HEX view** shows the raw bytes.
+- **Quick command buttons:** turn commands you send often into buttons, optionally repeated at an interval (e.g. `READ` every 2 s).
 - **Auto-reconnect:** if the USB cable drops or the board restarts, the data received so far is saved and the app reconnects when the port is back.
 - **Never loses a recording by accident:** asks before closing / reconnecting / opening a file when data is unsaved, writes files atomically (no half-written files), and splits very long live recordings every 1 million rows so memory never fills up.
 - **Built for long tests (days or weeks):** in live monitor mode the recording is saved to the same file at an interval you choose (default every 5 minutes), **Save now** writes it immediately, the computer is kept awake while connected, and a banner warns when the disk is getting full.
-- **Keyboard shortcuts:** F5 connect/disconnect · Ctrl+S save now · Ctrl+Shift+S save as · Ctrl+O open · Ctrl+L clear terminal · F1 guide.
-- **Themes:** dark, light or follow Windows, in six colors (blue, pink, purple, green, orange, teal).
+- **Keyboard shortcuts:** F5 connect/disconnect · Ctrl+S save now · Ctrl+Shift+S save as · Ctrl+O open · Ctrl+L clear terminal · Ctrl+M add note · F1 guide.
+- **Colored themes:** dark, light or follow Windows. *Neutral* gray or six colors (blue, pink, purple, green, orange, teal); picking a color tints the whole screen.
 - **English / Turkish** interface, settings are remembered (*? → Reset settings* if anything goes wrong).
 - **DEMO port** to try everything without a board.
 - **Built-in illustrated guide** (English / Turkish): click **?** or press **F1**. The same menu has *Check for updates*, *Report a problem / suggestion* and *About*.

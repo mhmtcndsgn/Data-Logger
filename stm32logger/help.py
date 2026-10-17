@@ -10,7 +10,8 @@ from __future__ import annotations
 import html as _html
 import re
 
-TOPICS = ["quickstart", "connect", "modes", "format", "saving", "longrun", "chart", "look", "trouble", "security"]
+TOPICS = ["quickstart", "connect", "modes", "format", "saving", "longrun", "chart", "analysis", "look", "trouble",
+          "security"]
 
 
 def S(*rows) -> str:
@@ -59,7 +60,8 @@ GUIDE: dict[str, dict[str, tuple[str, str, str]]] = {
                 (6, "Bağlan / Bağlantıyı kes", "Kısayol: <b>F5</b>."),
                 (7, "Örnekleme frekansı", "Kart sabit hızda örnekliyorsa (ör. 1000 Hz) yazın; Excel'de her örneğin zamanı hesaplanır. Bilmiyorsanız boş bırakın."),
                 (8, "Sıra numarası", "<i>Otomatik algıla</i> çoğu zaman doğrudur. İlk sütun 0, 1, 2… diye artıyorsa kayıp satırlar yakalanır."),
-                (9, "Aktarım bitiş süresi", "Deney aktarımında bu kadar süre veri gelmezse aktarım bitti sayılır. <b>1 s</b> iyi bir değerdir."))
+                (9, "Aktarım bitiş süresi", "Deney aktarımında bu kadar süre veri gelmezse aktarım bitti sayılır. <b>1 s</b> iyi bir değerdir."),
+                (10, "Kanallar ve birimler", "Ham değeri gerçek birime çevirir (ör. ADC → Volt). Ayrıntı: <i>Analiz</i> konusu."))
             + TIP("⚠️", "<b>Port görünmüyorsa:</b> Arduino klonları ve ESP kartları için <b>CH340</b> ya da <b>CP2102</b> sürücüsünü kurun. "
                          "Kablonun sadece şarj kablosu olmadığından emin olun. Port başka bir programda (Arduino IDE seri monitörü, STM32CubeIDE) açıksa önce oradan kapatın.")),
         "modes": ("Canlı izleme ve deney aktarımı", "Kartınızın veriyi nasıl gönderdiğine göre mod seçin.",
@@ -124,17 +126,34 @@ GUIDE: dict[str, dict[str, tuple[str, str, str]]] = {
                 (4, "PNG kaydet", "Grafiği rapor için resim olarak kaydeder."),
                 (5, "Gösterge", "Bir kanalın adına tıklayınca o kanal gizlenir / gösterilir."),
                 (6, "HEX / Duraklat / Temizle", "<b>HEX</b> gelen baytları onaltılık gösterir (baud yanlışsa ya da kart ikili veri gönderiyorsa işe yarar). Temizle: <b>Ctrl+L</b>. Kayıt etkilenmez."),
-                (7, "Komut gönder", "Karta yazı gönderir (ör. <code>GONDER</code>). <b>HEX</b> işaretliyse <code>01 A0 FF</code> gibi bayt gönderir. <b>↑ / ↓</b> önceki komutları getirir."))
+                (7, "Hızlı komut butonları", "Sık gönderdiğiniz komutlar tek tıkla gider. <b>＋</b> ile ekleyin, sağ tıkla düzenleyin / silin. Tekrar aralığı verirseniz buton basılı kaldıkça komut her X saniyede bir gönderilir."),
+                (8, "Komut gönder", "Karta yazı gönderir (ör. <code>GONDER</code>). <b>HEX</b> işaretliyse <code>01 A0 FF</code> gibi bayt gönderir. <b>↑ / ↓</b> önceki komutları getirir."))
             + TIP("🖱️", "Tekerlek: yakınlaştır · Sol tık sürükle: kaydır · Sağ tık: eksen seçenekleri")),
+        "analysis": ("Analiz: FFT, imleç, istatistik, notlar", "Kaydı uygulamadan çıkmadan inceleyin.",
+            "{img:analysis|Analiz araçları}"
+            + S((1, "📏 İmleç", "Grafiğe A ve B çizgileri koyar. Fareyle sürükleyin."),
+                (2, "Ölçüm", "A ve B'deki değerler, aradaki fark (Δ) ve <b>1/Δ</b> frekansı. Bir periyodun başına ve sonuna koyarsanız frekansı okursunuz."),
+                (3, "📊 FFT", "Grafikte görünen aralığın frekans içeriği. Titreşim, balans, motor gibi ölçümlerde hangi frekansın baskın olduğunu gösterir."),
+                (4, "FFT grafiği", "Doğru Hz için <b>örnekleme frekansını</b> girin. Yakınlaştırırsanız sadece o aralığın FFT'si alınır."),
+                (5, "📝 Not ekle", "Kayıt sırasında o ana not düşer (Ctrl+M). Grafikte sarı çizgiyle, Excel'de <b>Not</b> sütununda görünür; <b>Notlar</b> sekmesinde listelenir."),
+                (6, "Not çizgisi", "Notun eklendiği an."),
+                (7, "İstatistik", "Her kanal için son değer, min, max, ortalama, <b>RMS</b>, standart sapma ve FFT açıksa tepe frekansı — grafikte görünen aralık üzerinden."))
+            + "<h3>Kanallar ve birimler</h3>"
+            "<p><b>Veri ayarları → Kanallar ve birimler…</b> ile ham değeri gerçek birime çevirin: "
+            "<b>gerçek değer = ham × çarpan + ofset</b>. <b>ADC → Volt…</b> butonu referans gerilimi ve bit sayısından çarpanı hesaplar "
+            "(12 bit, 3,3 V → 0,000806). Grafik, istatistik ve kaydedilen dosyalar dönüştürülmüş değerleri kullanır; sütun adı "
+            "<code>Kanal 1 [V]</code> olur. Ham yedek hiç değişmez.</p>"
+            + TIP("💡", "Örnek: LM35 sıcaklık sensörü 10 mV/°C verir. 12 bit ADC, 3,3 V ile çarpan = 0,000806 × 100 = 0,0806, birim °C.")),
         "look": ("Tema ve kısayollar", "Uygulamayı istediğiniz renklerde kullanın.",
             "<p>Sağ üstteki renkli yuvarlak butondan seçin:</p>"
             + S(("🌗", "Görünüm", "<b>Koyu</b>, <b>Açık</b> ya da <b>Sistem</b> (Windows'un koyu/açık ayarına uyar)."),
-                ("🎨", "Renk", "Mavi, pembe, mor, yeşil, turuncu ya da turkuaz. Butonlar, seçili öğeler ve grafiğin ilk kanalı bu renge boyanır."))
+                ("🎨", "Renk", "<b>Nötr</b> (klasik gri), mavi, pembe, mor, yeşil, turuncu ya da turkuaz. Renk seçince bütün ekran — zemin, kartlar, grafik, terminal — o rengin tonlarına bürünür."))
             + "<h3>Kısayollar</h3>"
             + TABLE(["Tuş", "İş"],
                     [["<b>F5</b>", "Bağlan / bağlantıyı kes"], ["<b>Ctrl+S</b>", "Şimdi kaydet"],
                      ["<b>Ctrl+Shift+S</b>", "Farklı kaydet"], ["<b>Ctrl+O</b>", "Kayıtlı dosyayı aç"],
-                     ["<b>Ctrl+L</b>", "Terminali temizle"], ["<b>↑ / ↓</b>", "Önceki komutlar"], ["<b>F1</b>", "Bu kılavuz"]])),
+                     ["<b>Ctrl+L</b>", "Terminali temizle"], ["<b>Ctrl+M</b>", "Not ekle"], ["<b>↑ / ↓</b>", "Önceki komutlar"],
+                     ["<b>F1</b>", "Bu kılavuz"]])),
         "trouble": ("Sorun giderme", "Kırmızı bant ve kırmızı eksik sayısı bazı satırların gelmediğini gösterir.",
             "{img:trouble|Kayıplı bir aktarım}"
             + S((1, "Kırmızı bant", "Kaç örneğin eksik olduğunu söyler."),
@@ -184,7 +203,8 @@ GUIDE: dict[str, dict[str, tuple[str, str, str]]] = {
                 (6, "Connect / Disconnect", "Shortcut: <b>F5</b>."),
                 (7, "Sample rate", "If your board samples at a fixed rate (e.g. 1000 Hz), enter it; Excel then gets a time column. Leave it empty if unknown."),
                 (8, "Sequence number", "<i>Auto-detect</i> is usually right. If the first column counts 0, 1, 2…, lost lines are detected."),
-                (9, "Transfer end timeout", "In experiment dump mode the transfer counts as finished after this much silence. <b>1 s</b> is a good value."))
+                (9, "Transfer end timeout", "In experiment dump mode the transfer counts as finished after this much silence. <b>1 s</b> is a good value."),
+                (10, "Channels and units", "Converts raw values to real units (e.g. ADC → Volt). Details: <i>Analysis</i> topic."))
             + TIP("⚠️", "<b>Port not listed?</b> Install the <b>CH340</b> or <b>CP2102</b> driver for Arduino clones and ESP boards. "
                          "Make sure the cable is not charge-only, and close the port in other programs (Arduino IDE serial monitor, STM32CubeIDE).")),
         "modes": ("Live vs. experiment mode", "Pick the mode that matches how your board sends data.",
@@ -249,17 +269,34 @@ GUIDE: dict[str, dict[str, tuple[str, str, str]]] = {
                 (4, "Save PNG", "Saves the chart as an image for reports."),
                 (5, "Legend", "Click a channel name to hide or show it."),
                 (6, "HEX / Pause / Clear", "<b>HEX</b> shows received bytes in hexadecimal (useful with a wrong baud rate or binary data). Clear: <b>Ctrl+L</b>. Recording is not affected."),
-                (7, "Send command", "Sends text to the board (e.g. <code>SEND</code>). With <b>HEX</b> ticked it sends bytes like <code>01 A0 FF</code>. <b>↑ / ↓</b> recalls previous commands."))
+                (7, "Quick command buttons", "Commands you send often, one click away. Add with <b>＋</b>, right-click to edit / delete. With a repeat interval the button stays pressed and sends the command every X seconds."),
+                (8, "Send command", "Sends text to the board (e.g. <code>SEND</code>). With <b>HEX</b> ticked it sends bytes like <code>01 A0 FF</code>. <b>↑ / ↓</b> recalls previous commands."))
             + TIP("🖱️", "Wheel: zoom · Left-drag: pan · Right-click: axis options")),
+        "analysis": ("Analysis: FFT, cursors, statistics, notes", "Inspect the recording without leaving the app.",
+            "{img:analysis|Analysis tools}"
+            + S((1, "📏 Cursors", "Places lines A and B on the chart. Drag them with the mouse."),
+                (2, "Readout", "Values at A and B, the difference (Δ) and <b>1/Δ</b> frequency. Put them at the start and end of one period to read the frequency."),
+                (3, "📊 FFT", "Frequency content of the visible part of the chart. Shows the dominant frequency in vibration, balancing or motor measurements."),
+                (4, "FFT chart", "Enter the <b>sample rate</b> for correct Hz. Zoom in to analyse only that range."),
+                (5, "📝 Add note", "Adds a note at that moment while recording (Ctrl+M). Shown as a yellow line on the chart, in the <b>Note</b> column in Excel and in the <b>Notes</b> tab."),
+                (6, "Note line", "The moment the note was added."),
+                (7, "Statistics", "Last value, min, max, mean, <b>RMS</b>, standard deviation and, with FFT on, the peak frequency for each channel — over the visible range."))
+            + "<h3>Channels and units</h3>"
+            "<p>Use <b>Data settings → Channels and units…</b> to convert raw values to real units: "
+            "<b>real value = raw × scale + offset</b>. <b>ADC → Volt…</b> computes the scale from the reference voltage and bit count "
+            "(12-bit, 3.3 V → 0.000806). The chart, statistics and saved files use the converted values; the column is named "
+            "<code>Channel 1 [V]</code>. The raw backup never changes.</p>"
+            + TIP("💡", "Example: an LM35 temperature sensor gives 10 mV/°C. With a 12-bit ADC at 3.3 V the scale is 0.000806 × 100 = 0.0806, unit °C.")),
         "look": ("Theme and shortcuts", "Use the app in the colors you like.",
             "<p>Use the colored round button at the top right:</p>"
             + S(("🌗", "Appearance", "<b>Dark</b>, <b>Light</b> or <b>System</b> (follows Windows' dark/light setting)."),
-                ("🎨", "Color", "Blue, pink, purple, green, orange or teal. Buttons, selections and the first chart channel use this color."))
+                ("🎨", "Color", "<b>Neutral</b> (classic gray), blue, pink, purple, green, orange or teal. With a color, the whole screen — background, cards, chart, terminal — takes on its shades."))
             + "<h3>Shortcuts</h3>"
             + TABLE(["Key", "Action"],
                     [["<b>F5</b>", "Connect / disconnect"], ["<b>Ctrl+S</b>", "Save now"],
                      ["<b>Ctrl+Shift+S</b>", "Save as"], ["<b>Ctrl+O</b>", "Open saved file"],
-                     ["<b>Ctrl+L</b>", "Clear terminal"], ["<b>↑ / ↓</b>", "Previous commands"], ["<b>F1</b>", "This guide"]])),
+                     ["<b>Ctrl+L</b>", "Clear terminal"], ["<b>Ctrl+M</b>", "Add note"], ["<b>↑ / ↓</b>", "Previous commands"],
+                     ["<b>F1</b>", "This guide"]])),
         "trouble": ("Troubleshooting", "A red banner and a red Missing count mean some lines never arrived.",
             "{img:trouble|A transfer with lost data}"
             + S((1, "Red banner", "Says how many samples are missing."),

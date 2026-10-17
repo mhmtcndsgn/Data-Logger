@@ -1,10 +1,15 @@
-"""Tema: koyu / açık zemin + renk paleti (mavi, pembe, mor, yeşil, turuncu, turkuaz).
+"""Tema: koyu / açık zemin + renk (nötr gri ya da mavi, pembe, mor, yeşil, turuncu, turkuaz).
+
+Renk seçilince sadece butonlar değil bütün ekran (zemin, kartlar, grafik, terminal) o rengin
+tonlarına boyanır; "nötr" klasik gri görünümdür.
 
 Renkler modül değişkeni olarak tutulur (th.BG, th.ACCENT ...). apply() bunları
 değiştirir, build_qss() güncel renklerle stil sayfasını üretir. Arayüz renkleri
 her seferinde th.<AD> diye okuduğu için tema anında değişir.
 """
 from __future__ import annotations
+
+import colorsys
 
 MODES = ("system", "dark", "light")
 
@@ -34,6 +39,7 @@ BASES = {
 
 # Renk paletleri: (buton/seçili, üzerine gelince, yazı-koyu zemin, yazı-açık zemin)
 ACCENTS = {
+    "neutral": ("#1f6feb", "#388bfd", "#58a6ff", "#0969da"),   # gri zemin, mavi vurgu
     "blue":   ("#1f6feb", "#388bfd", "#58a6ff", "#0969da"),
     "pink":   ("#db2777", "#ec4899", "#f472b6", "#be185d"),
     "purple": ("#7c3aed", "#8b5cf6", "#a78bfa", "#6d28d9"),
@@ -47,16 +53,48 @@ GREEN, GREEN_HI = "#238636", "#2ea043"
 RED, RED_HI = "#b62324", "#da3633"
 
 MODE = "dark"
-ACCENT_NAME = "blue"
+ACCENT_NAME = "neutral"
 
 
-def apply(mode: str = "dark", accent: str = "blue") -> None:
+def _hsl(h: float, s: float, l: float) -> str:
+    r, g, b = colorsys.hls_to_rgb(h, l, s)
+    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def _rgb(hexcol: str) -> tuple[int, int, int]:
+    return tuple(int(hexcol[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def tinted_base(accent: str, mode: str) -> dict:
+    """Seçilen rengin tonlarından zemin paleti (yazılar her renkte okunur kalacak kontrastta)."""
+    r, g, b = _rgb(ACCENTS[accent][2])
+    h = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)[0]
+    base = dict(BASES[mode])
+    if mode == "dark":
+        base.update(
+            BG=_hsl(h, .45, .09), BG_PANEL=_hsl(h, .42, .14), BG_RAISED=_hsl(h, .38, .19), BG_INPUT=_hsl(h, .45, .09),
+            BG_PLOT=_hsl(h, .5, .06), BORDER=_hsl(h, .28, .27), BORDER_SOFT=_hsl(h, .28, .2), TEXT=_hsl(h, .25, .93),
+            MUTED=_hsl(h, .14, .66), FAINT=_hsl(h, .11, .52), HOVER=_hsl(h, .3, .23), HOVER_BORDER=_hsl(h, .24, .35),
+            PRESSED=_hsl(h, .3, .16), SCROLL_HOVER=_hsl(h, .18, .4), TERM_TEXT=_hsl(h, .85, .82),
+            TIP_BG=_hsl(h, .4, .16), BANNER_INFO=_hsl(h, .4, .16), LEGEND_BG=(*_rgb(_hsl(h, .42, .14)), 225))
+    else:
+        base.update(
+            BG=_hsl(h, .75, .92), BG_PANEL=_hsl(h, .8, .975), BG_RAISED=_hsl(h, .6, .9), BG_INPUT=_hsl(h, .8, .985),
+            BG_PLOT=_hsl(h, .8, .99), BORDER=_hsl(h, .4, .8), BORDER_SOFT=_hsl(h, .45, .87), TEXT=_hsl(h, .3, .13),
+            MUTED=_hsl(h, .16, .36), FAINT=_hsl(h, .12, .5), HOVER=_hsl(h, .58, .88), HOVER_BORDER=_hsl(h, .34, .7),
+            PRESSED=_hsl(h, .45, .84), SCROLL_HOVER=_hsl(h, .22, .6), TERM_TEXT=_hsl(h, .7, .28),
+            TIP_BG=_hsl(h, .72, .94), BANNER_INFO=_hsl(h, .72, .94), LEGEND_BG=(*_rgb(_hsl(h, .8, .975)), 235))
+    return base
+
+
+def apply(mode: str = "dark", accent: str = "neutral") -> None:
     """mode: "dark" | "light" (system önceden çözülmüş olmalı)."""
     global MODE, ACCENT_NAME, BLUE, BLUE_HI, BLUE_TXT, ACCENT, ACCENT_HI, ACCENT_TXT, SERIES
     MODE = mode if mode in BASES else "dark"
-    ACCENT_NAME = accent if accent in ACCENTS else "blue"
+    ACCENT_NAME = accent if accent in ACCENTS else "neutral"
     g = globals()
-    for k, v in BASES[MODE].items():
+    base = BASES[MODE] if ACCENT_NAME == "neutral" else tinted_base(ACCENT_NAME, MODE)
+    for k, v in base.items():
         g[k] = v
     a, hi, txt_dark, txt_light = ACCENTS[ACCENT_NAME]
     ACCENT, ACCENT_HI = a, hi
@@ -85,7 +123,7 @@ def resolve_mode(mode: str) -> str:
     return "dark"
 
 
-apply("dark", "blue")
+apply("dark", "neutral")
 
 _QSS = """
 * {{ outline: 0; }}
@@ -202,6 +240,25 @@ QListWidget::item:selected {{ background: {ACCENT}; color: white; }}
 QListWidget::item:hover:!selected {{ background: {HOVER}; color: {TEXT}; }}
 QTextBrowser {{ background: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 10px; padding: 10px 16px; }}
 QScrollArea QLabel {{ background: {BG_PLOT}; }}
+
+QTabWidget::pane {{ border: none; background: transparent; }}
+QTabWidget > QWidget, QTabWidget QStackedWidget > QWidget {{ background: {BG_PANEL}; }}
+QTabBar {{ background: transparent; qproperty-drawBase: 0; }}
+QTabBar::tab {{ background: transparent; color: {MUTED}; padding: 7px 14px; margin-right: 4px;
+    border: none; border-bottom: 2px solid transparent; font-weight: 700; }}
+QTabBar::tab:selected {{ color: {TEXT}; border-bottom: 2px solid {ACCENT}; }}
+QTabBar::tab:hover:!selected {{ color: {TEXT}; }}
+QTableWidget {{ background: {BG_PLOT}; alternate-background-color: {BG_PANEL}; border: 1px solid {BORDER_SOFT};
+    border-radius: 6px; gridline-color: {BORDER_SOFT}; selection-background-color: {ACCENT}; selection-color: white; }}
+QHeaderView::section {{ background: {BG_RAISED}; color: {MUTED}; border: none; border-bottom: 1px solid {BORDER};
+    padding: 6px; font-weight: 700; }}
+QListWidget#Notes {{ background: {BG_PLOT}; border: 1px solid {BORDER_SOFT}; border-radius: 6px; padding: 4px; }}
+QListWidget#Notes::item {{ padding: 6px; color: {TEXT}; }}
+QPushButton#Tool {{ padding: 4px 10px; font-weight: 600; }}
+QPushButton#Tool:checked {{ background: {ACCENT}; border-color: {ACCENT_HI}; color: white; }}
+QPushButton#Quick {{ padding: 3px 10px; font-weight: 600; border-radius: 12px; }}
+QPushButton#Quick:checked {{ background: {ACCENT}; border-color: {ACCENT_HI}; color: white; }}
+#Readout {{ color: {MUTED}; font-size: 9pt; background: transparent; }}
 """
 
 

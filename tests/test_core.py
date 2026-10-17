@@ -486,4 +486,142 @@ def test_theme_palettes_build():
             assert "{" in qss and "ACCENT" not in qss and th.ACCENT in qss
             assert th.SERIES[0] == th.ACCENT_TXT and len(set(th.SERIES)) == len(th.SERIES)
             assert th.TEXT in th.help_css()
-    th.apply("dark", "blue")
+    th.apply("dark", "neutral")
+
+
+def test_theme_contrast_readable():
+    """Her renk/görünümde yazılar okunur kalmalı (WCAG kontrast oranı)."""
+    from stm32logger.ui import theme as th
+
+    def lum(hx):
+        c = [int(hx[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        c = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+    def ratio(a, b):
+        la, lb = sorted((lum(a), lum(b)), reverse=True)
+        return (la + 0.05) / (lb + 0.05)
+
+    for mode in ("dark", "light"):
+        for acc in th.ACCENTS:
+            th.apply(mode, acc)
+            assert ratio(th.TEXT, th.BG) >= 7 and ratio(th.TEXT, th.BG_PANEL) >= 7, (mode, acc)
+            assert ratio(th.MUTED, th.BG_PANEL) >= 4.5, (mode, acc, ratio(th.MUTED, th.BG_PANEL))
+            assert ratio(th.TERM_TEXT, th.BG_PLOT) >= 4.5, (mode, acc)
+            assert ratio(th.ACCENT_TXT, th.BG_PANEL) >= 3, (mode, acc, ratio(th.ACCENT_TXT, th.BG_PANEL))
+    th.apply("dark", "neutral")
+
+
+def test_units_and_notes_export_import():
+    from stm32logger import analysis
+
+    s = Session(mode="dma")
+    _feed(s, ["seq,adc", "0,0", "1,4095", "2,2048", "3,1024"])
+    s.units = {"adc": {"scale": analysis.adc_scale(3.3, 12), "offset": 0.0, "unit": "V"}}
+    s.notes.append((1, 1.0, "=motor açıldı"))
+    s.notes.append((99, 2.0, "son"))                 # satır sınırı dışı -> son satıra bağlanır
+    d = tempfile.mkdtemp()
+    p = export_session(s, os.path.join(d, "u.csv"), "csv")
+    txt = open(p, encoding="utf-8-sig").read()
+    assert "adc [V]" in txt and "'=motor açıldı" in txt and "3.3" in txt
+    s2 = load_file(p)
+    assert s2.channels == ["adc [V]"] and abs(s2.cols[0][1] - 3.3) < 1e-9
+    assert [(r, txt) for r, _, txt in s2.notes] == [(1, "=motor açıldı"), (3, "son")]
+    p = export_session(s, os.path.join(d, "u.xlsx"), "xlsx")
+    from openpyxl import load_workbook
+
+    ws = load_workbook(p).worksheets[1]
+    heads = [c.value for c in ws[1]]
+    ni = heads.index("Not") + 1
+    assert ws.cell(3, ni).value == "=motor açıldı" and ws.cell(3, ni).data_type == "s"
+    s3 = load_file(p)
+    assert len(s3.notes) == 2 and abs(s3.cols[0][1] - 3.3) < 1e-9
+
+
+def test_notes_with_delimiters_roundtrip_and_no_double_units():
+    s = Session(mode="live")
+    _feed(s, ["a,b", "5,10", "9,20", "2,30", "7,40"])   # a ardışık değil (sıra no sanılmasın)
+    s.units = {"a": {"scale": 2.0, "offset": 0.0, "unit": ""}}      # birimsiz: sütun adı değişmez
+    with s.lock:
+        assert s.add_note("sıcak, fan\tdevrede\nikinci satır", 1.0, row=1) == 1
+        s.add_note('tırnak "x"', 2.0)
+    assert s.notes[0][2] == "sıcak, fan devrede ikinci satır"
+    with s.lock:
+        s.add_note("zil\x07 esc\x1b son\x7f", 3.0)
+    assert s.notes[-1][2] == "zil esc son"
+    assert s.unsaved()
+    d = tempfile.mkdtemp()
+    for fmt in ("csv", "txt"):
+        info = {}
+        p = export_session(s, os.path.join(d, "n." + fmt), fmt, info=info)
+        assert info == {"rows": 4, "notes": 3}
+        s2 = load_file(p)
+        assert s2.imported and not s2.unsaved()
+        assert s2.channels == ["a", "b"], (fmt, s2.channels)
+        assert list(s2.cols[0]) == [10.0, 18.0, 4.0, 14.0] and list(s2.cols[1]) == [10.0, 20.0, 30.0, 40.0], fmt
+        assert [(r, t) for r, _, t in s2.notes] == [(1, "sıcak, fan devrede ikinci satır"),
+                                                    (3, 'tırnak "x" | zil esc son')], fmt
+        # açılan dosya birimsiz yeniden kaydedilir (arayüz units={} verir): değerler ikinci kez çarpılmaz
+        p2 = export_session(s2, os.path.join(d, "n2." + fmt), fmt, units={})
+        assert list(load_file(p2).cols[0]) == [10.0, 18.0, 4.0, 14.0]
+    p = export_session(s, os.path.join(d, "n.xlsx"), "xlsx")        # kontrol karakteri Excel'i bozmamalı
+    assert len(load_file(p).notes) == 2
+    s.mark_saved()
+    assert not s.unsaved()
+    # elle düzenlenmiş CSV: kapanmamış tırnak sonraki satırları yutmamalı
+    p = os.path.join(d, "el.csv")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("Sıra,Not,a\n" + "".join(f'{i},{"\"oops" if i == 3 else ""},{i * 7 % 5}\n' for i in range(10)))
+    s4 = load_file(p)
+    assert s4.n == 10 and list(s4.cols[0])[4:6] == [3.0, 0.0]
+
+
+def test_quick_cmd_sanitize_and_hex():
+    from stm32logger.ui.tools import parse_hex, sanitize_cmds
+
+    cmds = sanitize_cmds([{"label": "a", "cmd": "X", "repeat": 1e-6}, {"label": "b", "cmd": "Y", "repeat": "nan"},
+                          {"label": "c", "cmd": "Z", "repeat": 99999}, {"label": "d", "cmd": "W", "repeat": 0.5}, 5])
+    assert [c["repeat"] for c in cmds] == [0.0, 0.0, 3600.0, 0.5]
+    assert parse_hex("0x01, 0xA0 ff") == b"\x01\xa0\xff"
+    try:
+        parse_hex("zz")
+        raise AssertionError
+    except ValueError:
+        pass
+
+
+def test_analysis_fft_stats():
+    import numpy as np
+
+    from stm32logger import analysis
+
+    fs = 1000.0
+    t = np.arange(4096) / fs
+    y = 2.0 * np.sin(2 * np.pi * 50 * t) + 0.5
+    y[100] = np.nan
+    f, a, peak, amp = analysis.spectrum(y, fs)
+    assert abs(peak - 50) < 0.5 and 1.7 < amp < 2.2
+    # kısa pencere (4 s): sıfır doldurma sayesinde tepe 1/T = 0,25 Hz'den daha isabetli bulunur
+    ts = np.arange(4000) / fs
+    _f, _a, peak2, _amp2 = analysis.spectrum(np.sin(2 * np.pi * 2.3 * ts), fs)
+    assert abs(peak2 - 2.3) < 0.05
+    st = analysis.stats(y)
+    assert abs(st["mean"] - 0.5) < 0.01 and abs(st["rms"] - np.sqrt(2 + 0.25)) < 0.02
+    assert abs(analysis.estimate_fs(t) - fs) < 1e-6
+    # USB paketleri: 10'ar satır aynı zaman damgasıyla gelir -> yine ~1000 Hz bulunmalı
+    burst = np.repeat(np.arange(400) * 0.01, 10)
+    assert abs(analysis.estimate_fs(burst) - 1000) < 5
+    # duraklama (59 s veri yok) hızı düşürmemeli
+    pause = np.r_[np.arange(1000) / 1000, 60 + np.arange(1000) / 1000]
+    assert abs(analysis.estimate_fs(pause) - 1000) < 5
+    # periyodik sinyalde örnekleme hatası olmasın (fs/4 sinüsü: RMS 0,707)
+    sq = np.tile([0.0, 1.0, 0.0, -1.0], 500_000)
+    st = analysis.stats(np.r_[np.nan, sq, np.inf])
+    assert abs(st["rms"] - np.sqrt(0.5)) < 1e-9 and st["min"] == -1 and st["last"] == -1
+    off = analysis.stats(1e9 + np.array([0.0, 2.0, 4.0]))
+    assert abs(off["std"] - np.std([0, 2, 4])) < 1e-6 and abs(off["mean"] - (1e9 + 2)) < 1e-6
+    assert analysis.stats(np.array([np.inf, np.nan])) is None and analysis.stats(np.array([])) is None
+    assert analysis.nearest(t, 0.0123) == 12
+    assert analysis.sanitize_units({"a": {"scale": "x"}, "b": {"scale": 2, "offset": 1, "unit": "V"}}) == \
+        {"b": {"scale": 2.0, "offset": 1.0, "unit": "V"}}
+    assert analysis.fmt(2048.0) == "2048" and analysis.fmt(float("nan")) == "—"
